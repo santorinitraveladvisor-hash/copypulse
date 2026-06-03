@@ -1,0 +1,123 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model User {
+  id            String          @id @default(cuid())
+  email         String          @unique
+  password      String
+  exchangeAccounts ExchangeAccount[]
+  riskSettings  RiskSettings?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+}
+
+model ExchangeAccount {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+  name         String
+  exchange     String   @default("binance")
+  apiKey       String
+  apiSecret    String
+  isTestnet    Boolean  @default(true)
+  isActive     Boolean  @default(true)
+  copiedOrders CopiedOrder[]
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Trader {
+  id               String         @id @default(cuid())
+  name             String
+  walletAddress    String?
+  signalSourceType String         // WEBHOOK, TELEGRAM, DISCORD
+  riskMultiplier   Float          @default(1.0)
+  maxTradeSize     Float          @default(100.0) // In USDT
+  allowedPairs     String         @default("BTCUSDT,ETHUSDT")
+  isActive         Boolean        @default(true)
+  signals          IncomingSignal[]
+  orders           CopiedOrder[]
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+}
+
+model IncomingSignal {
+  id           String   @id @default(cuid())
+  traderId     String
+  trader       Trader   @relation(fields: [traderId], references: [id])
+  symbol       String
+  side         String   // BUY, SELL
+  entryPrice   Float?
+  stopLoss     Float?
+  takeProfit   Float?
+  positionSize Float?
+  rawPayload   String
+  status       String   @default("PENDING") // PENDING, EXECUTED, FAILED, SKIPPED
+  errorMessage String?
+  orders       CopiedOrder[]
+  createdAt    DateTime @default(now())
+}
+
+model CopiedOrder {
+  id                String          @id @default(cuid())
+  signalId          String?
+  signal            IncomingSignal? @relation(fields: [signalId], references: [id])
+  traderId          String
+  trader            Trader          @relation(fields: [traderId], references: [id])
+  exchangeAccountId String
+  exchangeAccount   ExchangeAccount @relation(fields: [exchangeAccountId], references: [id])
+  symbol            String
+  side              String
+  orderType         String          @default("MARKET")
+  quantity          Float
+  price             Float?
+  status            String          @default("PENDING") // PENDING, FILLED, CANCELED, FAILED
+  exchangeOrderId   String?
+  fillPrice         Float?
+  fillQuantity      Float?
+  fee               Float?
+  feeAsset          String?
+  errorMessage      String?
+  latencyMs         Int?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+}
+
+model Position {
+  id           String   @id @default(cuid())
+  symbol       String
+  quantity     Float
+  entryPrice   Float
+  currentPrice Float?
+  unrealizedPnl Float?
+  status       String   @default("OPEN") // OPEN, CLOSED
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model RiskSettings {
+  id                String @id @default(cuid())
+  userId            String @unique
+  user              User   @relation(fields: [userId], references: [id])
+  globalKillSwitch  Boolean @default(false)
+  maxDailyLoss      Float?
+  maxOpenTrades     Int    @default(5)
+  maxAllocationPerTrader Float?
+  maxAllocationPerSymbol Float?
+  stopAfterXFailures Int   @default(3)
+  updatedAt         DateTime @updatedAt
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  action    String
+  details   String?
+  severity  String   @default("INFO") // INFO, WARNING, ERROR, CRITICAL
+  createdAt DateTime @default(now())
+}

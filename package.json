@@ -9,12 +9,26 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@binance/w3w-ethereum-provider": "^1.1.13",
+    "@prisma/client": "^6.19.3",
+    "@walletconnect/ethereum-provider": "^2.23.9",
+    "@walletconnect/modal": "^2.7.0",
+    "binance-api-node": "^0.13.9",
+    "clsx": "^2.1.1",
+    "crypto-js": "^4.2.0",
+    "ethers": "^6.16.0",
+    "ioredis": "^5.11.0",
+    "lucide-react": "^1.17.0",
     "next": "16.2.6",
+    "prisma": "^6.19.3",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "tailwind-merge": "^3.6.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@types/crypto-js": "^4.2.2",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
