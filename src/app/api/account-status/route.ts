@@ -16,7 +16,7 @@ export async function GET() {
 
     // 1. Get Spot Balance
     const spotInfo = await client.accountInfo();
-    const spotUsdt = spotInfo.balances.find(b => b.asset === 'USDT');
+    const spotUsdt = spotInfo.balances.find((b: any) => b.asset === 'USDT');
     const spotTotal = spotUsdt ? parseFloat(spotUsdt.free) : 0;
 
     // 2. Get Funding/User Balance (Where P2P money usually sits)
