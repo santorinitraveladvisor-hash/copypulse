@@ -1,4 +1,6 @@
-import Binance, { Binance as BinanceClient } from 'binance-api-node';
+import Binance from 'binance-api-node';
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type BinanceClient = ReturnType<typeof Binance>;
 
 export function getBinanceClient(keys: {apiKey: string, apiSecret: string, isTestnet: boolean}): BinanceClient {
   return Binance({

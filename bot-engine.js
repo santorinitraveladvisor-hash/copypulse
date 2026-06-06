@@ -8,6 +8,7 @@
 
 require('dotenv').config();
 const axios = require('axios');
+const crypto = require('crypto');
 const { ethers } = require('ethers');
 const { PrismaClient } = require('@prisma/client');
 
@@ -19,29 +20,39 @@ const prisma = new PrismaClient();
 const CONFIG = {
   BSCSCAN_API_KEY: process.env.BSCSCAN_API_KEY || 'XJSBR7BPBT4X3Z595RYXNTCJFYGC3BHTYC',
   BSC_RPC: process.env.BSC_RPC || 'https://bsc-dataseed1.binance.org/',
-  WALLET_PRIVATE_KEY: process.env.WALLET_PRIVATE_KEY || '', // Your BSC wallet private key
-  
+  WALLET_PRIVATE_KEY: process.env.WALLET_PRIVATE_KEY || '',
+
+  // Binance API — used for momentum cross-check before executing buys
+  BINANCE_API_KEY: process.env.BINANCE_API_KEY || '',
+  BINANCE_SECRET_KEY: process.env.BINANCE_SECRET_KEY || '',
+
   // Trading params
-  MAX_TRADE_BNB: parseFloat(process.env.MAX_TRADE_BNB || '0.05'),     // Max BNB per trade
-  TAKE_PROFIT_PCT: parseFloat(process.env.TAKE_PROFIT_PCT || '100'),   // 100% = 2x
-  STOP_LOSS_PCT: parseFloat(process.env.STOP_LOSS_PCT || '30'),        // -30% stop loss
+  MAX_TRADE_BNB: parseFloat(process.env.MAX_TRADE_BNB || '0.05'),
+  TAKE_PROFIT_PCT: parseFloat(process.env.TAKE_PROFIT_PCT || '100'),
+  STOP_LOSS_PCT: parseFloat(process.env.STOP_LOSS_PCT || '30'),
   MAX_OPEN_POSITIONS: parseInt(process.env.MAX_OPEN_POSITIONS || '5'),
   MAX_DAILY_LOSS_BNB: parseFloat(process.env.MAX_DAILY_LOSS_BNB || '0.5'),
 
+  // Momentum gates — skip buy if market is in heavy downtrend
+  MIN_BNB_24H_CHANGE: -5,   // skip if BNB down >5% in 24h
+  MIN_BTC_24H_CHANGE: -8,   // skip if BTC down >8% in 24h (macro crash)
+
   // Polling intervals (ms)
-  WALLET_POLL_MS: 15000,      // Check wallets every 15s
-  DISCOVERY_POLL_MS: 3600000, // Re-discover top wallets every hour
-  POSITION_POLL_MS: 30000,    // Check positions every 30s
+  WALLET_POLL_MS: 15000,
+  DISCOVERY_POLL_MS: 3600000,
+  POSITION_POLL_MS: 30000,
 
   // Auto-discovery params
-  MIN_WIN_RATE: 0.60,         // 60% win rate minimum
-  MIN_TRADES: 10,             // Minimum trades to qualify
-  TOP_WALLETS_TO_TRACK: 10,   // How many wallets to auto-track
+  MIN_WIN_RATE: 0.60,
+  MIN_TRADES: 10,
+  TOP_WALLETS_TO_TRACK: 10,
 };
 
 // ─────────────────────────────────────────────
 // BSC / PANCAKESWAP CONSTANTS
 // ─────────────────────────────────────────────
+const BINANCE_API = 'https://api.binance.com';
+
 const PANCAKE_ROUTER = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
 const WBNB = '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c';
 const BSCSCAN_API = 'https://api.bscscan.com/api';
@@ -351,6 +362,14 @@ async function processTx(tx, walletAddress, walletInfo) {
   }
 
   log(`🎯 Signal detected! Wallet ${walletInfo.name} bought token ${tokenAddress}`);
+
+  // Cross-check momentum on Binance before committing
+  const momentum = await checkBinanceMomentum();
+  if (!momentum.ok) {
+    log(`⏸️  Trade blocked by momentum gate: ${momentum.reason}`);
+    await auditLog('TRADE_BLOCKED_MOMENTUM', { tokenAddress, walletAddress, reason: momentum.reason });
+    return;
+  }
 
   // Save signal to DB
   const signal = await prisma.incomingSignal.create({
@@ -669,6 +688,74 @@ async function tokenSafetyCheck(tokenAddress) {
 }
 
 // ─────────────────────────────────────────────
+// BINANCE API — momentum cross-check
+// ─────────────────────────────────────────────
+
+// Public ticker — no auth needed
+async function binanceGet(endpoint, params = {}) {
+  const res = await axios.get(`${BINANCE_API}${endpoint}`, {
+    params,
+    headers: CONFIG.BINANCE_API_KEY ? { 'X-MBX-APIKEY': CONFIG.BINANCE_API_KEY } : {},
+    timeout: 5000,
+  });
+  return res.data;
+}
+
+// Signed request for account-level endpoints
+async function binanceSignedGet(endpoint, params = {}) {
+  const timestamp = Date.now();
+  const query = new URLSearchParams({ ...params, timestamp }).toString();
+  const signature = crypto.createHmac('sha256', CONFIG.BINANCE_SECRET_KEY).update(query).digest('hex');
+  const res = await axios.get(`${BINANCE_API}${endpoint}?${query}&signature=${signature}`, {
+    headers: { 'X-MBX-APIKEY': CONFIG.BINANCE_API_KEY },
+    timeout: 5000,
+  });
+  return res.data;
+}
+
+let lastMomentumCheck = { time: 0, result: null };
+
+async function checkBinanceMomentum() {
+  // Cache for 60s — avoid hammering Binance on every detected tx
+  if (Date.now() - lastMomentumCheck.time < 60000 && lastMomentumCheck.result) {
+    return lastMomentumCheck.result;
+  }
+
+  try {
+    const [bnb, btc] = await Promise.all([
+      binanceGet('/api/v3/ticker/24hr', { symbol: 'BNBUSDT' }),
+      binanceGet('/api/v3/ticker/24hr', { symbol: 'BTCUSDT' }),
+    ]);
+
+    const bnbChange = parseFloat(bnb.priceChangePercent);
+    const btcChange = parseFloat(btc.priceChangePercent);
+
+    log(`📈 Binance momentum — BNB: ${bnbChange > 0 ? '+' : ''}${bnbChange.toFixed(2)}% | BTC: ${btcChange > 0 ? '+' : ''}${btcChange.toFixed(2)}%`);
+
+    if (bnbChange < CONFIG.MIN_BNB_24H_CHANGE) {
+      const result = { ok: false, reason: `BNB down ${bnbChange.toFixed(1)}% in 24h — skipping trade`, bnbChange, btcChange };
+      lastMomentumCheck = { time: Date.now(), result };
+      return result;
+    }
+
+    if (btcChange < CONFIG.MIN_BTC_24H_CHANGE) {
+      const result = { ok: false, reason: `BTC down ${btcChange.toFixed(1)}% in 24h — macro risk too high`, bnbChange, btcChange };
+      lastMomentumCheck = { time: Date.now(), result };
+      return result;
+    }
+
+    const result = { ok: true, bnbChange, btcChange };
+    lastMomentumCheck = { time: Date.now(), result };
+    return result;
+
+  } catch (e) {
+    // Fail open — don't block trades if Binance API is unreachable
+    log(`⚠️  Binance momentum check failed (${e.message}) — proceeding anyway`);
+    return { ok: true, bnbChange: 0, btcChange: 0 };
+  }
+}
+
+// ─────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────
 async function getRecentBlock(blocksBack) {
@@ -718,6 +805,7 @@ function startStatusServer() {
         trackedWallets: trackedWallets.size,
         openPositions: openPositions.size,
         dailyLossBNB,
+        momentum: lastMomentumCheck.result,
         positions: Array.from(openPositions.entries()).map(([addr, p]) => ({
           token: addr,
           symbol: p.symbol,

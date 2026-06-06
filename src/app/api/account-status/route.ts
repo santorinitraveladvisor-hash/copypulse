@@ -23,7 +23,7 @@ export async function GET() {
     // Note: This requires "Permits Universal Transfer" permission on your API Key
     let fundingTotal = 0;
     try {
-      const userAssets = await client.userAsset();
+      const userAssets = await (client as any).userAsset();
       const fundingUsdt = userAssets.find((a: any) => a.asset === 'USDT');
       fundingTotal = fundingUsdt ? parseFloat(fundingUsdt.free) : 0;
     } catch (e) {

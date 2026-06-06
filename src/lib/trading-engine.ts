@@ -19,7 +19,7 @@ export async function processSignal(signal: { traderId: string, symbol: string, 
     let order;
     if (signal.side === 'BUY') {
       const usdtAmount = trader.maxTradeSize * trader.riskMultiplier;
-      order = await client.order({
+      order = await (client as any).order({
         symbol: signal.symbol,
         side: 'BUY',
         type: 'MARKET',
@@ -28,9 +28,9 @@ export async function processSignal(signal: { traderId: string, symbol: string, 
     } else {
       const asset = signal.symbol.replace('USDT', '');
       const accountInfo = await client.accountInfo();
-      const balance = accountInfo.balances.find(b => b.asset === asset);
+      const balance = accountInfo.balances.find((b: { asset: string; free: string }) => b.asset === asset);
       if (balance && parseFloat(balance.free) > 0) {
-        order = await client.order({
+        order = await (client as any).order({
           symbol: signal.symbol,
           side: 'SELL',
           type: 'MARKET',
