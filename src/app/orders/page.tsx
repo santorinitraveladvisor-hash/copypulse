@@ -1,6 +1,8 @@
 import { prisma } from '@/lib/prisma';
 import { History, TrendingUp, TrendingDown, Clock } from 'lucide-react';
 
+export const dynamic = 'force-dynamic';
+
 export default async function Orders() {
   const orders = await prisma.copiedOrder.findMany({
     include: { trader: true },

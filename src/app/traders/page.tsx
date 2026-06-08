@@ -1,6 +1,8 @@
-import { Users, Plus, Trash2, Wallet, Coins, AlertCircle } from 'lucide-react';
+import { Plus, Wallet } from 'lucide-react';
 import { prisma } from '@/lib/prisma';
 import { addTrader, deleteTrader } from './actions';
+
+export const dynamic = 'force-dynamic';
 
 export default async function Traders() {
   const traders = await prisma.trader.findMany();
