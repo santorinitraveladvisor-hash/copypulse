@@ -1,18 +1,18 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { JsonRpcProvider, formatEther } from 'ethers';
+
+const WALLET = '0xD7D4E440b6E99d097C061cb53639D404d421Ff6B';
+const BSC_RPC = 'https://bsc-dataseed1.binance.org/';
 
 export async function GET() {
-  try {
-    const traderCount = await prisma.trader.count({ where: { isActive: true } });
-    const orderCount = await prisma.copiedOrder.count();
+  const [traderCount, orderCount, balance] = await Promise.all([
+    prisma.trader.count({ where: { isActive: true } }).catch(() => 0),
+    prisma.copiedOrder.count().catch(() => 0),
+    new JsonRpcProvider(BSC_RPC).getBalance(WALLET)
+      .then(b => `${parseFloat(formatEther(b)).toFixed(4)} BNB`)
+      .catch(() => '— BNB'),
+  ]);
 
-    return NextResponse.json({
-      balance: "See Binance App",
-      status: "Bot Running",
-      traderCount,
-      orderCount,
-    });
-  } catch (e: any) {
-    return NextResponse.json({ balance: "—", status: "DB Error: " + e.message, traderCount: 0, orderCount: 0 });
-  }
+  return NextResponse.json({ balance, status: 'Bot Running', traderCount, orderCount });
 }
