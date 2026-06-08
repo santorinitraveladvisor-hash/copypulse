@@ -46,6 +46,11 @@ const CONFIG = {
   MIN_WIN_RATE: 0.60,
   MIN_TRADES: 10,
   TOP_WALLETS_TO_TRACK: 10,
+
+  // Safety mode
+  // SELF_TRADE=true  → run all safety checks and execute real buys
+  // SELF_TRADE=false → monitor-only (log signals, never trade)
+  SELF_TRADE: process.env.SELF_TRADE === 'true',
 };
 
 // ─────────────────────────────────────────────
@@ -53,9 +58,20 @@ const CONFIG = {
 // ─────────────────────────────────────────────
 const BINANCE_API = 'https://api.binance.com';
 
-const PANCAKE_ROUTER = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
+const PANCAKE_ROUTER  = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
+const PANCAKE_FACTORY = '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73';
 const WBNB = '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c';
 const BSCSCAN_API = 'https://api.bscscan.com/api';
+
+// ─────────────────────────────────────────────
+// BLACKLIST — known rug / scam token addresses
+// ─────────────────────────────────────────────
+const BLACKLISTED_TOKENS = new Set([
+  '0xb8c77482e45f1f44de1745f52c74426c631bdd52', // fake BNB
+  '0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82', // CAKE (avoid copy-buy)
+  // Add more as discovered
+  ...(process.env.BLACKLIST_TOKENS || '').split(',').filter(Boolean).map(a => a.toLowerCase()),
+]);
 
 const PANCAKE_ROUTER_ABI = [
   'function swapExactETHForTokensSupportingFeeOnTransferTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable',
@@ -70,6 +86,9 @@ const ERC20_ABI = [
   'function symbol() view returns (string)',
   'function totalSupply() view returns (uint256)',
 ];
+
+const FACTORY_ABI = ['function getPair(address,address) view returns (address)'];
+const PAIR_ABI    = ['function getReserves() view returns (uint112,uint112,uint32)'];
 
 // ─────────────────────────────────────────────
 // STATE
@@ -416,9 +435,10 @@ async function getTokenFromTx(txHash) {
 // TRADE EXECUTOR
 // ─────────────────────────────────────────────
 async function executeBuy(tokenAddress, signalId, traderId) {
-  if (!wallet) {
-    log(`📋 [MONITOR MODE] Would buy ${tokenAddress} — set WALLET_PRIVATE_KEY to enable trading`);
-    await prisma.incomingSignal.update({ where: { id: signalId }, data: { status: 'SKIPPED', errorMessage: 'Monitor mode - no wallet key' } });
+  if (!wallet || !CONFIG.SELF_TRADE) {
+    const reason = !wallet ? 'No WALLET_PRIVATE_KEY set' : 'SELF_TRADE=false (monitor-only mode)';
+    log(`📋 [MONITOR MODE] Signal: ${tokenAddress} — ${reason}`);
+    await prisma.incomingSignal.update({ where: { id: signalId }, data: { status: 'SKIPPED', errorMessage: reason } });
     return;
   }
 
@@ -641,50 +661,127 @@ async function estimateBNBReceived(tokenAddress, tokenAmount) {
 }
 
 // ─────────────────────────────────────────────
-// TOKEN SAFETY CHECK
+// TOKEN SAFETY CHECK — 6-layer filter
 // ─────────────────────────────────────────────
 async function tokenSafetyCheck(tokenAddress) {
+  const addr = tokenAddress.toLowerCase();
+
+  // 1. Blacklist
+  if (BLACKLISTED_TOKENS.has(addr)) {
+    log(`🚫 [BLACKLIST] ${tokenAddress} is on the blacklist`);
+    return { ok: false, reason: 'Token is blacklisted' };
+  }
+
+  // 2. Honeypot detection + tax check (honeypot.is)
+  try {
+    const hp = await axios.get(`https://api.honeypot.is/v2/IsHoneypot?address=${tokenAddress}&chainID=56`, { timeout: 6000 });
+    const data = hp.data;
+
+    if (data.honeypotResult?.isHoneypot) {
+      log(`🚫 [HONEYPOT] ${tokenAddress} — ${data.honeypotResult.honeypotReason || 'flagged'}`);
+      return { ok: false, reason: `Honeypot: ${data.honeypotResult.honeypotReason || 'detected'}` };
+    }
+
+    const buyTax  = data.simulationResult?.buyTax  ?? 0;
+    const sellTax = data.simulationResult?.sellTax ?? 0;
+    if (buyTax > 10) {
+      log(`🚫 [TAX] ${tokenAddress} buy tax ${buyTax}% > 10%`);
+      return { ok: false, reason: `Buy tax too high: ${buyTax}%` };
+    }
+    if (sellTax > 10) {
+      log(`🚫 [TAX] ${tokenAddress} sell tax ${sellTax}% > 10%`);
+      return { ok: false, reason: `Sell tax too high: ${sellTax}%` };
+    }
+
+    log(`✅ [HONEYPOT] clean — buy: ${buyTax}% / sell: ${sellTax}%`);
+  } catch (e) {
+    log(`⚠️  [HONEYPOT] check failed (${e.message}) — skipping`);
+  }
+
+  // 3. Contract age + 4. Liquidity check (DexScreener — no API key needed)
+  try {
+    const ds = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`, { timeout: 6000 });
+    const pairs = ds.data?.pairs?.filter(p => p.chainId === 'bsc') || [];
+
+    if (pairs.length > 0) {
+      const best = pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
+
+      // Contract age
+      if (best.pairCreatedAt) {
+        const ageHours = (Date.now() - best.pairCreatedAt) / 3_600_000;
+        if (ageHours < 1) {
+          log(`🚫 [AGE] ${tokenAddress} pair created ${ageHours.toFixed(1)}h ago — too new`);
+          return { ok: false, reason: `Token too new: pair created ${ageHours.toFixed(1)}h ago` };
+        }
+        log(`✅ [AGE] pair age: ${ageHours.toFixed(1)}h`);
+      }
+
+      // Liquidity
+      const liquidityUsd = best.liquidity?.usd || 0;
+      if (liquidityUsd < 10_000) {
+        log(`🚫 [LIQUIDITY] ${tokenAddress} only $${liquidityUsd.toFixed(0)} liquidity`);
+        return { ok: false, reason: `Insufficient liquidity: $${liquidityUsd.toFixed(0)} (min $10,000)` };
+      }
+      log(`✅ [LIQUIDITY] $${liquidityUsd.toFixed(0)}`);
+    } else {
+      // Fallback: check on-chain reserves directly from PancakeSwap
+      try {
+        const factory = new ethers.Contract(PANCAKE_FACTORY, FACTORY_ABI, provider);
+        const pairAddr = await factory.getPair(tokenAddress, WBNB);
+        if (pairAddr === ethers.ZeroAddress) {
+          log(`🚫 [LIQUIDITY] No PancakeSwap pair found for ${tokenAddress}`);
+          return { ok: false, reason: 'No PancakeSwap WBNB pair found' };
+        }
+        const pair = new ethers.Contract(pairAddr, PAIR_ABI, provider);
+        const [r0, r1] = await pair.getReserves();
+        // Determine which reserve is WBNB
+        const wbnbReserve = parseFloat(ethers.formatEther(tokenAddress.toLowerCase() < WBNB.toLowerCase() ? r1 : r0));
+        // Approximate USD: assume BNB ≈ $600 (rough gate, not price feed)
+        const approxUsd = wbnbReserve * 600;
+        if (approxUsd < 10_000) {
+          log(`🚫 [LIQUIDITY] on-chain: ~$${approxUsd.toFixed(0)} (${wbnbReserve.toFixed(2)} BNB)`);
+          return { ok: false, reason: `Insufficient on-chain liquidity: ~$${approxUsd.toFixed(0)}` };
+        }
+        log(`✅ [LIQUIDITY] on-chain: ~$${approxUsd.toFixed(0)}`);
+      } catch (e) {
+        log(`⚠️  [LIQUIDITY] on-chain fallback failed: ${e.message}`);
+      }
+    }
+  } catch (e) {
+    log(`⚠️  [DEXSCREENER] check failed (${e.message}) — skipping`);
+  }
+
+  // 5. Top holder concentration (BSCScan — best-effort, fail open if API unavailable)
   try {
     const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
-
-    // Check total supply exists
     const supply = await tokenContract.totalSupply();
-    if (supply === 0n) return { ok: false, reason: 'Zero supply' };
+    if (supply === 0n) {
+      log(`🚫 [SUPPLY] zero supply`);
+      return { ok: false, reason: 'Zero total supply' };
+    }
 
-    // Check BSCScan for contract verification
-    const res = await axios.get(BSCSCAN_API, {
-      params: {
-        module: 'contract',
-        action: 'getsourcecode',
-        address: tokenAddress,
-        apikey: CONFIG.BSCSCAN_API_KEY,
-      }
-    });
-
-    // Check token holder concentration (top holders)
     const holdersRes = await axios.get(BSCSCAN_API, {
-      params: {
-        module: 'token',
-        action: 'tokenholderlist',
-        contractaddress: tokenAddress,
-        page: 1,
-        offset: 10,
-        apikey: CONFIG.BSCSCAN_API_KEY,
-      }
+      params: { module: 'token', action: 'tokenholderlist', contractaddress: tokenAddress, page: 1, offset: 10, apikey: CONFIG.BSCSCAN_API_KEY },
+      timeout: 5000,
     });
 
     if (holdersRes.data.status === '1' && holdersRes.data.result?.length) {
       const topHolder = holdersRes.data.result[0];
-      const topHolderPct = parseFloat(topHolder.TokenHolderQuantity) / parseFloat(ethers.formatUnits(supply, 18)) * 100;
-      if (topHolderPct > 50) {
-        return { ok: false, reason: `Top holder owns ${topHolderPct.toFixed(0)}% — rug risk` };
+      const decimals = await tokenContract.decimals();
+      const topPct = parseFloat(ethers.formatUnits(topHolder.TokenHolderQuantity || '0', decimals)) /
+                     parseFloat(ethers.formatUnits(supply, decimals)) * 100;
+      if (topPct > 50) {
+        log(`🚫 [TOP_HOLDER] ${topPct.toFixed(0)}% held by single address`);
+        return { ok: false, reason: `Top holder owns ${topPct.toFixed(0)}% — rug risk` };
       }
+      log(`✅ [TOP_HOLDER] top holder: ${topPct.toFixed(1)}%`);
     }
-
-    return { ok: true };
   } catch (e) {
-    return { ok: true }; // fail open — don't block on API errors
+    log(`⚠️  [TOP_HOLDER] check failed (${e.message}) — skipping`);
   }
+
+  log(`✅ [SAFETY] ${tokenAddress} passed all checks`);
+  return { ok: true };
 }
 
 // ─────────────────────────────────────────────
