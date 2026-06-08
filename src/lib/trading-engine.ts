@@ -13,7 +13,7 @@ export async function processSignal(signal: { traderId: string, symbol: string, 
     const client = getBinanceClient({
       apiKey: decrypt(account.apiKey),
       apiSecret: decrypt(account.apiSecret),
-      isTestnet: false
+      isTestnet: true
     });
 
     let order;

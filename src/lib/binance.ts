@@ -6,8 +6,7 @@ export function getBinanceClient(keys: {apiKey: string, apiSecret: string, isTes
   return Binance({
     apiKey: keys.apiKey,
     apiSecret: keys.apiSecret,
-    // POINTING TO REAL BINANCE
-    httpBase: 'https://api.binance.com',
+    httpBase: keys.isTestnet ? 'https://testnet.binance.vision' : 'https://api.binance.com',
     getTime: () => Date.now(),
   });
 }
