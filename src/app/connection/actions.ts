@@ -12,22 +12,24 @@ export async function connectExchange(formData: FormData) {
     throw new Error('API Key and Secret are required');
   }
 
-  // 1. Encrypt the keys for safety
   const encryptedKey = encrypt(apiKey);
   const encryptedSecret = encrypt(apiSecret);
 
-  // 2. Save to your local database
-  // We check if the user exists first, if not we create one
   let user = await prisma.user.findFirst();
   if (!user) {
     user = await prisma.user.create({
       data: {
         email: 'admin@copypulse.local',
-        password: 'secure-password', // In a real app, use hashing
-        id: 'default-user'
+        password: 'secure-password',
       }
     });
   }
+
+  // Deactivate any existing exchange accounts before adding a new one
+  await prisma.exchangeAccount.updateMany({
+    where: { userId: user.id },
+    data: { isActive: false },
+  });
 
   await prisma.exchangeAccount.create({
     data: {
@@ -40,6 +42,5 @@ export async function connectExchange(formData: FormData) {
     }
   });
 
-  // 3. Go back to dashboard
   redirect('/dashboard');
 }

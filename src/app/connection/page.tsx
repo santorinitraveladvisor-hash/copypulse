@@ -1,6 +1,8 @@
 import { ShieldCheck, Key, Lock } from 'lucide-react';
 import { connectExchange } from './actions';
 
+export const dynamic = 'force-dynamic';
+
 export default function Connection() {
   return (
     <div className="max-w-2xl">
