@@ -4,6 +4,8 @@ import { Activity, TrendingUp, TrendingDown, CheckCircle, Wallet, BarChart2 } fr
 
 interface StatusData {
   balance: string;
+  bnbBalance: string | null;
+  usdtValue: number | null;
   status: string;
   traderCount: number;
   orderCount: number;
@@ -23,7 +25,7 @@ function fmt(n: number) {
 }
 
 export default function Dashboard() {
-  const [data, setData] = useState<StatusData>({ balance: '0.00', status: 'Connecting...', traderCount: 0, orderCount: 0, loading: true });
+  const [data, setData] = useState<StatusData>({ balance: '0.00', bnbBalance: null, usdtValue: null, status: 'Connecting...', traderCount: 0, orderCount: 0, loading: true });
   const [pnl, setPnl] = useState<PnlData>({ pnlAllTime: 0, pnlToday: 0, winsAllTime: 0, totalTrades: 0, loading: true });
 
   useEffect(() => {
@@ -60,7 +62,20 @@ export default function Dashboard() {
             <span className="text-slate-400 text-[10px] font-black uppercase tracking-widest">BNB Balance</span>
             <Wallet className="text-blue-500" size={18} />
           </div>
-          <div className="text-2xl font-black text-slate-700">{data.loading ? '...' : data.balance}</div>
+          {data.loading ? (
+            <div className="text-2xl font-black text-slate-300">...</div>
+          ) : (
+            <>
+              <div className="text-2xl font-black text-slate-700">
+                {data.bnbBalance ?? '—'} BNB
+              </div>
+              {data.usdtValue !== null && (
+                <div className="text-sm font-bold text-slate-400 mt-1">
+                  ${data.usdtValue.toLocaleString()} USDT
+                </div>
+              )}
+            </>
+          )}
         </div>
 
         <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">

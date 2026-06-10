@@ -6,13 +6,28 @@ const WALLET = '0xD7D4E440b6E99d097C061cb53639D404d421Ff6B';
 const BSC_RPC = 'https://bsc-dataseed1.binance.org/';
 
 export async function GET() {
-  const [traderCount, orderCount, balance] = await Promise.all([
+  const [traderCount, orderCount, bnbRaw, bnbPrice] = await Promise.all([
     prisma.trader.count({ where: { isActive: true } }).catch(() => 0),
     prisma.copiedOrder.count().catch(() => 0),
     new JsonRpcProvider(BSC_RPC).getBalance(WALLET)
-      .then(b => `${parseFloat(formatEther(b)).toFixed(4)} BNB`)
-      .catch(() => '— BNB'),
+      .then(b => parseFloat(formatEther(b)))
+      .catch(() => null),
+    fetch('https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT')
+      .then(r => r.json())
+      .then(d => parseFloat(d.price))
+      .catch(() => null),
   ]);
 
-  return NextResponse.json({ balance, status: 'Bot Running', traderCount, orderCount });
+  const bnbBalance = bnbRaw !== null ? bnbRaw.toFixed(4) : null;
+  const usdtValue  = bnbRaw !== null && bnbPrice !== null
+    ? Math.round(bnbRaw * bnbPrice)
+    : null;
+
+  const balance = bnbBalance !== null
+    ? usdtValue !== null
+      ? `${bnbBalance} BNB ($${usdtValue.toLocaleString()} USDT)`
+      : `${bnbBalance} BNB`
+    : '— BNB';
+
+  return NextResponse.json({ balance, bnbBalance, usdtValue, status: 'Bot Running', traderCount, orderCount });
 }
