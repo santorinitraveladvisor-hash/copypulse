@@ -103,6 +103,7 @@ let router;
 let trackedWallets = new Map();   // address -> { name, lastBlock, stats }
 let openPositions = new Map();    // tokenAddress -> { buyPrice, amount, bnbSpent, entryTime }
 let dailyLossBNB = 0;
+let dailyPnLBNB  = 0;
 let lastDailyReset = new Date().toDateString();
 let lastScannedBlock = 0;
 const pairTokenCache = new Map(); // pairAddr -> tokenAddr
@@ -576,9 +577,11 @@ async function executeSell(tokenAddress, position, reason) {
     const sellPrice = position.tokenAmount > 0 ? bnbReceived / position.tokenAmount : 0;
 
     if (pnlBNB < 0) dailyLossBNB += Math.abs(pnlBNB);
+    dailyPnLBNB += pnlBNB;
 
     const pnlSign = pnlBNB >= 0 ? '+' : '';
-    log(`💰 PnL: ${pnlSign}${pnlBNB.toFixed(4)} BNB (${pnlSign}${pnlPct.toFixed(1)}%) on ${position.symbol} | Reason: ${reason}`);
+    const todaySign = dailyPnLBNB >= 0 ? '+' : '';
+    log(`💰 PnL: ${pnlSign}${pnlBNB.toFixed(4)} BNB (${pnlSign}${pnlPct.toFixed(1)}%) on ${position.symbol} | Reason: ${reason} | Total today: ${todaySign}${dailyPnLBNB.toFixed(4)} BNB`);
 
     await prisma.tradeResult.create({
       data: {
@@ -606,6 +609,8 @@ async function executeSell(tokenAddress, position, reason) {
         side: 'SELL',
         orderType: 'MARKET',
         quantity: parseFloat(ethers.formatUnits(tokenBalance, decimals)),
+        price: position.bnbSpent,
+        fillPrice: bnbReceived,
         status: 'FILLED',
         exchangeOrderId: tx.hash,
         fee: pnlBNB,
@@ -899,8 +904,9 @@ function resetDailyLoss() {
   const today = new Date().toDateString();
   if (today !== lastDailyReset) {
     dailyLossBNB = 0;
+    dailyPnLBNB  = 0;
     lastDailyReset = today;
-    log('🔄 Daily loss counter reset');
+    log('🔄 Daily counters reset');
   }
 }
 
