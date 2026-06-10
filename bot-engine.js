@@ -176,6 +176,8 @@ async function refreshTraders() {
     for (const trader of allTraders) {
       if (!trader.walletAddress) continue;
       if (trader.signalSourceType !== 'AUTO_DISCOVERED') continue; // keep manual/webhook wallets
+      // skip wallets added within the last 48h — they haven't had time to trade yet
+      if (trader.createdAt && (Date.now() - new Date(trader.createdAt).getTime()) < 48 * 60 * 60 * 1000) continue;
 
       const addr = trader.walletAddress.toLowerCase();
       const padded = padAddr(addr);
