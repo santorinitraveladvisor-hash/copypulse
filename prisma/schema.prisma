@@ -122,3 +122,18 @@ model AuditLog {
   severity  String   @default("INFO") // INFO, WARNING, ERROR, CRITICAL
   createdAt DateTime @default(now())
 }
+
+model TradeResult {
+  id           String   @id @default(cuid())
+  symbol       String
+  tokenAddress String
+  traderId     String?
+  exitReason   String
+  buyPrice     Float
+  sellPrice    Float
+  bnbSpent     Float
+  bnbReceived  Float
+  pnlBnb       Float
+  pnlPct       Float
+  createdAt    DateTime @default(now())
+}

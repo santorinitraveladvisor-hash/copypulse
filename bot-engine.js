@@ -573,10 +573,27 @@ async function executeSell(tokenAddress, position, reason) {
     const bnbReceived = await estimateBNBReceived(tokenAddress, tokenBalance);
     const pnlBNB = bnbReceived - position.bnbSpent;
     const pnlPct = (pnlBNB / position.bnbSpent) * 100;
+    const sellPrice = position.tokenAmount > 0 ? bnbReceived / position.tokenAmount : 0;
 
     if (pnlBNB < 0) dailyLossBNB += Math.abs(pnlBNB);
 
-    log(`✅ SELL executed! ${position.symbol} | PnL: ${pnlBNB.toFixed(4)} BNB (${pnlPct.toFixed(1)}%) | Reason: ${reason}`);
+    const pnlSign = pnlBNB >= 0 ? '+' : '';
+    log(`💰 PnL: ${pnlSign}${pnlBNB.toFixed(4)} BNB (${pnlSign}${pnlPct.toFixed(1)}%) on ${position.symbol} | Reason: ${reason}`);
+
+    await prisma.tradeResult.create({
+      data: {
+        symbol:       position.symbol || tokenAddress.slice(0, 10),
+        tokenAddress,
+        traderId:     position.traderId || null,
+        exitReason:   reason,
+        buyPrice:     position.buyPrice,
+        sellPrice,
+        bnbSpent:     position.bnbSpent,
+        bnbReceived,
+        pnlBnb:       pnlBNB,
+        pnlPct,
+      },
+    }).catch(e => log(`⚠️  TradeResult save failed: ${e.message}`));
 
     openPositions.delete(tokenAddress);
 

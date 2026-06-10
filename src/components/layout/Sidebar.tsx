@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { LayoutDashboard, Users, Settings, History, ShieldAlert, Activity } from 'lucide-react';
+import { LayoutDashboard, Users, Settings, History, ShieldAlert, Activity, BarChart2 } from 'lucide-react';
 import { WalletLogin } from './WalletLogin';
 
 const menuItems = [
@@ -7,6 +7,7 @@ const menuItems = [
   { name: 'Traders', icon: Users, href: '/traders' },
   { name: 'Signals Log', icon: Activity, href: '/signals' },
   { name: 'Orders', icon: History, href: '/orders' },
+  { name: 'PnL Tracker', icon: BarChart2, href: '/pnl' },
   { name: 'Binance Connection', icon: Settings, href: '/connection' },
 ];
 
