@@ -18,16 +18,10 @@ export async function GET() {
       .catch(() => null),
   ]);
 
-  const bnbBalance = bnbRaw !== null ? bnbRaw.toFixed(4) : null;
+  const bnbBalance = bnbRaw !== null ? parseFloat(bnbRaw.toFixed(4)) : null;
   const usdtValue  = bnbRaw !== null && bnbPrice !== null
-    ? Math.round(bnbRaw * bnbPrice)
+    ? parseFloat((bnbRaw * bnbPrice).toFixed(2))
     : null;
 
-  const balance = bnbBalance !== null
-    ? usdtValue !== null
-      ? `${bnbBalance} BNB ($${usdtValue.toLocaleString()} USDT)`
-      : `${bnbBalance} BNB`
-    : '— BNB';
-
-  return NextResponse.json({ balance, bnbBalance, usdtValue, status: 'Bot Running', traderCount, orderCount });
+  return NextResponse.json({ bnbBalance, usdtValue, status: 'Bot Running', traderCount, orderCount });
 }

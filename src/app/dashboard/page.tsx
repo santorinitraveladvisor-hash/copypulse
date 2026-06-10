@@ -3,8 +3,7 @@ import { useState, useEffect } from 'react';
 import { Activity, TrendingUp, TrendingDown, CheckCircle, Wallet, BarChart2 } from 'lucide-react';
 
 interface StatusData {
-  balance: string;
-  bnbBalance: string | null;
+  bnbBalance: number | null;
   usdtValue: number | null;
   status: string;
   traderCount: number;
@@ -25,7 +24,7 @@ function fmt(n: number) {
 }
 
 export default function Dashboard() {
-  const [data, setData] = useState<StatusData>({ balance: '0.00', bnbBalance: null, usdtValue: null, status: 'Connecting...', traderCount: 0, orderCount: 0, loading: true });
+  const [data, setData] = useState<StatusData>({ bnbBalance: null, usdtValue: null, status: 'Connecting...', traderCount: 0, orderCount: 0, loading: true });
   const [pnl, setPnl] = useState<PnlData>({ pnlAllTime: 0, pnlToday: 0, winsAllTime: 0, totalTrades: 0, loading: true });
 
   useEffect(() => {
@@ -67,13 +66,11 @@ export default function Dashboard() {
           ) : (
             <>
               <div className="text-2xl font-black text-slate-700">
-                {data.bnbBalance ?? '—'} BNB
+                {data.usdtValue !== null ? `$${data.usdtValue.toFixed(2)}` : '—'}
               </div>
-              {data.usdtValue !== null && (
-                <div className="text-sm font-bold text-slate-400 mt-1">
-                  ${data.usdtValue.toLocaleString()} USDT
-                </div>
-              )}
+              <div className="text-sm font-bold text-slate-400 mt-1">
+                {data.bnbBalance !== null ? `${data.bnbBalance.toFixed(4)} BNB` : '—'}
+              </div>
             </>
           )}
         </div>
