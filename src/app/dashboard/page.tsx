@@ -49,7 +49,7 @@ export default function Dashboard() {
   return (
     <div className="space-y-8 animate-in fade-in duration-700">
       <div className="flex items-center justify-between">
-        <h1 className="text-4xl font-black text-slate-800 tracking-tighter">CopyPulse Live</h1>
+        <h1 className="text-2xl md:text-4xl font-black text-slate-800 tracking-tighter">CopyPulse Live</h1>
         <div className="flex items-center gap-2 bg-emerald-50 text-emerald-600 px-4 py-2 rounded-full border border-emerald-100 font-bold text-xs uppercase tracking-widest">
           <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div> System Active
         </div>

@@ -29,10 +29,10 @@ export default async function PnL() {
 
   return (
     <div className="max-w-6xl mx-auto space-y-8 animate-in fade-in duration-500">
-      <h1 className="text-3xl font-black text-slate-800 tracking-tighter">PnL Tracker</h1>
+      <h1 className="text-2xl md:text-3xl font-black text-slate-800 tracking-tighter">PnL Tracker</h1>
 
       {/* Summary cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4">
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
           <div className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-2">All-Time PnL</div>
           <div className={`text-2xl font-black ${pnlAllTime >= 0 ? 'text-emerald-600' : 'text-red-500'}`}>
@@ -56,8 +56,8 @@ export default async function PnL() {
       </div>
 
       {/* Trade table */}
-      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
-        <table className="w-full text-left">
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-x-auto">
+        <table className="w-full min-w-[800px] text-left">
           <thead className="bg-slate-50 border-b border-slate-200">
             <tr>
               <th className="px-5 py-4 font-black text-slate-500 text-[10px] uppercase tracking-widest">Time</th>

@@ -20,14 +20,14 @@ export default async function Signals() {
   return (
     <div className="max-w-6xl mx-auto space-y-8 animate-in fade-in duration-500">
       <div className="flex items-center justify-between">
-        <h1 className="text-3xl font-black text-slate-800 tracking-tighter">Signals Log</h1>
+        <h1 className="text-2xl md:text-3xl font-black text-slate-800 tracking-tighter">Signals Log</h1>
         <div className="flex items-center gap-2 text-slate-400 text-xs font-bold uppercase tracking-widest">
           <Activity size={14} /> Last 200 signals
         </div>
       </div>
 
-      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
-        <table className="w-full text-left">
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-x-auto">
+        <table className="w-full min-w-[700px] text-left">
           <thead className="bg-slate-50 border-b border-slate-200">
             <tr>
               <th className="px-6 py-4 font-black text-slate-500 text-[10px] uppercase tracking-widest">Time</th>

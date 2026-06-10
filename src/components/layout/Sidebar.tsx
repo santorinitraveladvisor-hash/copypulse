@@ -13,7 +13,7 @@ const menuItems = [
 
 export function Sidebar() {
   return (
-    <div className="w-64 bg-slate-900 text-white h-screen fixed left-0 top-0 p-4 border-r border-slate-800 flex flex-col z-50">
+    <div className="hidden md:flex w-64 bg-slate-900 text-white h-screen fixed left-0 top-0 p-4 border-r border-slate-800 flex-col z-50">
       <div className="text-2xl font-black mb-8 text-blue-400 px-2 tracking-tighter italic">CopyPulse</div>
       <nav className="flex-1 space-y-1">
         {menuItems.map((item) => (
