@@ -63,6 +63,10 @@ const PANCAKE_FACTORY = '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73';
 const WBNB = '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c';
 const BSCSCAN_API = 'https://api.bscscan.com/api';
 
+const SWAP_TOPIC        = '0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822';
+const PAIR_CREATED_TOPIC = '0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9';
+const TRANSFER_TOPIC    = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+
 // ─────────────────────────────────────────────
 // BLACKLIST — known rug / scam token addresses
 // ─────────────────────────────────────────────
@@ -100,6 +104,8 @@ let trackedWallets = new Map();   // address -> { name, lastBlock, stats }
 let openPositions = new Map();    // tokenAddress -> { buyPrice, amount, bnbSpent, entryTime }
 let dailyLossBNB = 0;
 let lastDailyReset = new Date().toDateString();
+let lastScannedBlock = 0;
+const pairTokenCache = new Map(); // pairAddr -> tokenAddr
 
 // ─────────────────────────────────────────────
 // INIT
@@ -126,8 +132,8 @@ async function init() {
   await loadWalletsFromDB();
 
   // Start all loops
-  await discoverTopWallets();
-  setInterval(discoverTopWallets, CONFIG.DISCOVERY_POLL_MS);
+  await refreshTraders();                                          // initial discovery + dormancy prune
+  setInterval(refreshTraders, 24 * 60 * 60 * 1000);              // daily re-scan
   setInterval(monitorWallets, CONFIG.WALLET_POLL_MS);
   setInterval(monitorPositions, CONFIG.POSITION_POLL_MS);
   setInterval(resetDailyLoss, 60000);
@@ -155,277 +161,276 @@ async function loadWalletsFromDB() {
 }
 
 // ─────────────────────────────────────────────
-// AUTO-DISCOVERY — finds top BSC trench traders
+// TRADER REFRESH — daily dormancy prune + fresh discovery
 // ─────────────────────────────────────────────
-async function discoverTopWallets() {
-  log('🔍 Auto-discovering top BSC wallets...');
+async function refreshTraders() {
+  log('♻️  Refreshing trader list (dormancy prune + new discovery)...');
   try {
-    // Strategy: find wallets that frequently interact with PancakeSwap
-    // and have high PnL by analyzing recent DEX transactions
-    const candidates = await fetchPancakeSwapActiveWallets();
-    const scored = await scoreWallets(candidates);
-    
-    const top = scored
-      .filter(w => w.winRate >= CONFIG.MIN_WIN_RATE && w.totalTrades >= CONFIG.MIN_TRADES)
-      .slice(0, CONFIG.TOP_WALLETS_TO_TRACK);
+    const currentBlock = await provider.getBlockNumber();
+    const sinceBlock   = currentBlock - 57600; // 48h at ~3s/block
+    const padAddr = a => '0x' + a.replace('0x','').toLowerCase().padStart(64,'0');
 
-    log(`📊 Discovered ${top.length} qualifying wallets`);
+    const allTraders = await prisma.trader.findMany({ where: { isActive: true } });
+    let dormantCount = 0;
 
-    for (const w of top) {
-      const addr = w.address.toLowerCase();
-      if (!trackedWallets.has(addr)) {
-        trackedWallets.set(addr, {
-          name: `AUTO_${addr.slice(0, 6)}`,
-          traderId: null,
-          lastBlock: 0,
-          source: 'AUTO',
-          stats: { wins: w.wins, losses: w.losses, winRate: w.winRate },
-        });
+    for (const trader of allTraders) {
+      if (!trader.walletAddress) continue;
+      if (trader.signalSourceType !== 'AUTO_DISCOVERED') continue; // keep manual/webhook wallets
 
-        // Save to DB as a trader record
-        const trader = await prisma.trader.create({
-          data: {
-            name: `AUTO_${addr.slice(0, 6).toUpperCase()}`,
-            walletAddress: w.address,
-            signalSourceType: 'WEBHOOK',
-            maxTradeSize: CONFIG.MAX_TRADE_BNB * 400, // approx USDT
-            riskMultiplier: 1.0,
-            allowedPairs: 'BSC_ANY',
-            isActive: true,
+      const addr = trader.walletAddress.toLowerCase();
+      const padded = padAddr(addr);
+
+      const [outLogs, inLogs] = await Promise.all([
+        provider.getLogs({ topics: [TRANSFER_TOPIC, padded], fromBlock: sinceBlock, toBlock: currentBlock }).catch(() => []),
+        provider.getLogs({ topics: [TRANSFER_TOPIC, null, padded], fromBlock: sinceBlock, toBlock: currentBlock }).catch(() => []),
+      ]);
+
+      if (outLogs.length + inLogs.length === 0) {
+        await prisma.trader.update({ where: { id: trader.id }, data: { isActive: false } });
+        trackedWallets.delete(addr);
+        dormantCount++;
+        log(`💤 Deactivated dormant: ${trader.name} (${addr.slice(0,10)}...)`);
+        await auditLog('WALLET_DEACTIVATED', { address: addr, reason: 'No on-chain activity in 48h' });
+      }
+      await sleep(200);
+    }
+
+    log(`♻️  Pruned ${dormantCount} dormant wallets`);
+
+    // Discover fresh wallets to keep the pool at TARGET
+    const TARGET = 15;
+    const activeCount = await prisma.trader.count({ where: { isActive: true } });
+    if (activeCount < TARGET) {
+      await discoverFreshEarlyBuyers(TARGET - activeCount);
+    }
+
+    // Reload trackedWallets from DB
+    await loadWalletsFromDB();
+  } catch (e) {
+    log(`❌ refreshTraders error: ${e.message}`);
+  }
+}
+
+// ─────────────────────────────────────────────
+// AUTO-DISCOVERY — PancakeSwap factory early-buyer scan
+// ─────────────────────────────────────────────
+async function discoverFreshEarlyBuyers(needed = 10) {
+  log(`🔍 Scanning for fresh early buyers (need ${needed})...`);
+  try {
+    const coder = new ethers.AbiCoder();
+    const currentBlock = await provider.getBlockNumber();
+    const since = currentBlock - 9600; // last 8h
+    const CHUNK = 2000;
+
+    // Step 1 — collect new WBNB pairs from PancakeSwap factory
+    const newPairs = [];
+    for (let from = since; from <= currentBlock; from += CHUNK) {
+      const to = Math.min(from + CHUNK - 1, currentBlock);
+      try {
+        const logs = await provider.getLogs({ address: PANCAKE_FACTORY, topics: [PAIR_CREATED_TOPIC], fromBlock: from, toBlock: to });
+        for (const l of logs) {
+          const t0 = ('0x' + l.topics[1].slice(26)).toLowerCase();
+          const t1 = ('0x' + l.topics[2].slice(26)).toLowerCase();
+          if (t0 !== WBNB.toLowerCase() && t1 !== WBNB.toLowerCase()) continue;
+          const pairAddr = ('0x' + l.data.slice(26, 66)).toLowerCase();
+          newPairs.push({ pairAddr, launchBlock: l.blockNumber, wbnbIsToken1: t0 !== WBNB.toLowerCase() });
+        }
+      } catch(e) {}
+      await sleep(80);
+    }
+    log(`  Found ${newPairs.length} new WBNB pairs in last 8h`);
+
+    // Step 2 — filter by liquidity via DexScreener (batch 30 at a time)
+    const qualified = [];
+    for (let i = 0; i < newPairs.length && qualified.length < 20; i += 30) {
+      const batch = newPairs.slice(i, i + 30);
+      try {
+        const resp = await axios.get(
+          `https://api.dexscreener.com/latest/dex/pairs/bsc/${batch.map(p => p.pairAddr).join(',')}`,
+          { timeout: 8000 }
+        );
+        const pairMap = {};
+        for (const p of resp.data?.pairs || []) pairMap[p.pairAddress?.toLowerCase()] = p;
+        for (const p of batch) {
+          const dp = pairMap[p.pairAddr];
+          if (!dp) continue;
+          const liq = dp.liquidity?.usd || 0;
+          if (liq < 5000) continue;
+          qualified.push({ ...p, liq, priceChange1h: dp.priceChange?.h1 || 0, symbol: dp.baseToken?.symbol || '?' });
+        }
+      } catch(e) {}
+      await sleep(300);
+    }
+    log(`  Qualified pairs (liq>$5k): ${qualified.length}`);
+
+    // Step 3 — scan first 5 min (100 blocks) of Swap events per pair, get tx.from
+    const walletStats = {};
+    for (const pair of qualified) {
+      const endBlock = Math.min(pair.launchBlock + 100, currentBlock);
+      for (let from = pair.launchBlock; from <= endBlock; from += 100) {
+        const to = Math.min(from + 99, endBlock);
+        try {
+          const logs = await provider.getLogs({ address: pair.pairAddr, topics: [SWAP_TOPIC], fromBlock: from, toBlock: to });
+          for (let i = 0; i < Math.min(logs.length, 40); i += 5) {
+            const batch = logs.slice(i, i + 5);
+            const txes = await Promise.all(batch.map(l => provider.getTransaction(l.transactionHash).catch(() => null)));
+            for (let j = 0; j < batch.length; j++) {
+              const tx = txes[j];
+              if (!tx?.from) continue;
+              const w = tx.from.toLowerCase();
+              let a0in, a1in;
+              try { [a0in, a1in] = coder.decode(['uint256','uint256','uint256','uint256'], batch[j].data); } catch(e) { continue; }
+              const bnbIn = pair.wbnbIsToken1 ? parseFloat(ethers.formatEther(a1in)) : parseFloat(ethers.formatEther(a0in));
+              if (bnbIn < 0.001) continue;
+              if (!walletStats[w]) walletStats[w] = {};
+              if (!walletStats[w][pair.pairAddr]) walletStats[w][pair.pairAddr] = { bnbIn: 0, priceChange1h: pair.priceChange1h };
+              walletStats[w][pair.pairAddr].bnbIn += bnbIn;
+            }
+            await sleep(80);
           }
-        });
-
-        trackedWallets.get(addr).traderId = trader.id;
-        log(`✨ Auto-added wallet: ${w.address} (winRate: ${(w.winRate * 100).toFixed(0)}%, trades: ${w.totalTrades})`);
-
-        await prisma.auditLog.create({
-          data: {
-            action: 'WALLET_AUTO_DISCOVERED',
-            details: JSON.stringify({ address: w.address, winRate: w.winRate, totalTrades: w.totalTrades }),
-            severity: 'INFO',
-          }
-        });
+        } catch(e) {}
+        await sleep(80);
       }
     }
+
+    // Step 4 — score by win rate (bought early + token is up)
+    const existing = await prisma.trader.findMany({ select: { walletAddress: true } });
+    const existingSet = new Set(existing.map(t => t.walletAddress?.toLowerCase()));
+
+    const scored = Object.entries(walletStats)
+      .map(([w, pairs]) => {
+        const entries = Object.values(pairs).filter(p => p.bnbIn > 0.001);
+        const profitable = entries.filter(p => p.priceChange1h > 0).length;
+        return { wallet: w, total: entries.length, profitable, winRate: entries.length > 0 ? profitable / entries.length : 0 };
+      })
+      .filter(s => s.winRate >= 0.5)
+      .sort((a, b) => b.winRate - a.winRate || b.total - a.total);
+
+    let added = 0;
+    for (const s of scored) {
+      if (added >= needed) break;
+      if (existingSet.has(s.wallet)) continue;
+      try {
+        const code = await provider.getCode(s.wallet);
+        if (code !== '0x') continue; // skip contracts
+      } catch(e) { continue; }
+
+      const name = `EARLY_${s.wallet.slice(2, 8).toUpperCase()}_W${Math.round(s.winRate * 100)}`;
+      const trader = await prisma.trader.create({
+        data: { name, walletAddress: s.wallet, maxTradeSize: CONFIG.MAX_TRADE_BNB * 400, riskMultiplier: 1.0, allowedPairs: 'BSC_ANY', isActive: true, signalSourceType: 'AUTO_DISCOVERED' }
+      });
+      trackedWallets.set(s.wallet, { name, traderId: trader.id, lastBlock: 0, source: 'AUTO', stats: { wins: 0, losses: 0 } });
+      log(`✨ New wallet: ${name} (${s.wallet})`);
+      await auditLog('WALLET_AUTO_DISCOVERED', { address: s.wallet, winRate: s.winRate });
+      added++;
+      await sleep(100);
+    }
+
+    log(`✨ discoverFreshEarlyBuyers added ${added} wallets`);
   } catch (e) {
-    log(`❌ Discovery error: ${e.message}`);
+    log(`❌ discoverFreshEarlyBuyers error: ${e.message}`);
   }
-}
-
-async function fetchPancakeSwapActiveWallets() {
-  // Get recent large PancakeSwap swap transactions
-  const res = await axios.get(BSCSCAN_API, {
-    params: {
-      module: 'account',
-      action: 'tokentx',
-      address: PANCAKE_ROUTER,
-      startblock: await getRecentBlock(50000), // ~last 50k blocks (~41hrs)
-      endblock: 'latest',
-      sort: 'desc',
-      apikey: CONFIG.BSCSCAN_API_KEY,
-    }
-  });
-
-  if (res.data.status !== '1') return [];
-
-  // Count unique wallet interactions
-  const walletActivity = new Map();
-  for (const tx of res.data.result || []) {
-    const addr = tx.from.toLowerCase();
-    if (!walletActivity.has(addr)) walletActivity.set(addr, new Set());
-    walletActivity.get(addr).add(tx.hash);
-  }
-
-  // Filter for wallets with multiple trades (active traders)
-  const candidates = [];
-  for (const [addr, txSet] of walletActivity.entries()) {
-    if (txSet.size >= CONFIG.MIN_TRADES) {
-      candidates.push(addr);
-    }
-  }
-
-  return candidates.slice(0, 50); // analyze top 50 candidates
-}
-
-async function scoreWallets(addresses) {
-  const scored = [];
-
-  for (const address of addresses) {
-    try {
-      const score = await analyzeWalletPnL(address);
-      if (score) scored.push({ address, ...score });
-      await sleep(200); // rate limit BSCScan
-    } catch (e) {
-      // skip failed
-    }
-  }
-
-  return scored.sort((a, b) => b.winRate - a.winRate);
-}
-
-async function analyzeWalletPnL(address) {
-  // Get BNB transaction history to estimate PnL
-  const res = await axios.get(BSCSCAN_API, {
-    params: {
-      module: 'account',
-      action: 'txlist',
-      address,
-      startblock: await getRecentBlock(100000),
-      endblock: 'latest',
-      sort: 'asc',
-      apikey: CONFIG.BSCSCAN_API_KEY,
-    }
-  });
-
-  if (res.data.status !== '1' || !res.data.result?.length) return null;
-
-  const txs = res.data.result.filter(tx =>
-    tx.to?.toLowerCase() === PANCAKE_ROUTER.toLowerCase() && tx.isError === '0'
-  );
-
-  if (txs.length < CONFIG.MIN_TRADES) return null;
-
-  // Simple PnL estimation: track BNB in/out via PancakeSwap
-  let wins = 0, losses = 0;
-  const tokenBuys = new Map();
-
-  for (const tx of txs) {
-    const value = parseFloat(ethers.formatEther(tx.value || '0'));
-    if (value > 0.001) {
-      // BNB spent = buy
-      const key = tx.hash;
-      tokenBuys.set(key, value);
-      wins++; // assume win for now, refine with token tx analysis
-    }
-  }
-
-  const totalTrades = wins + losses;
-  if (totalTrades < CONFIG.MIN_TRADES) return null;
-
-  return {
-    wins,
-    losses,
-    totalTrades,
-    winRate: wins / totalTrades,
-  };
 }
 
 // ─────────────────────────────────────────────
-// WALLET MONITOR — watches for new buys
+// WALLET MONITOR — watches for new buys via eth_getLogs
 // ─────────────────────────────────────────────
 async function monitorWallets() {
-  const currentBlock = await provider.getBlockNumber();
-
-  for (const [address, info] of trackedWallets.entries()) {
-    try {
-      const fromBlock = info.lastBlock || currentBlock - 100;
-      const txs = await getWalletTransactions(address, fromBlock, currentBlock);
-
-      for (const tx of txs) {
-        await processTx(tx, address, info);
-      }
-
-      trackedWallets.get(address).lastBlock = currentBlock;
-    } catch (e) {
-      // silent fail per wallet
-    }
-
-    await sleep(100); // rate limit
-  }
-}
-
-async function getWalletTransactions(address, fromBlock, toBlock) {
-  const res = await axios.get(BSCSCAN_API, {
-    params: {
-      module: 'account',
-      action: 'txlist',
-      address,
-      startblock: fromBlock,
-      endblock: toBlock,
-      sort: 'asc',
-      apikey: CONFIG.BSCSCAN_API_KEY,
-    }
-  });
-
-  if (res.data.status !== '1') return [];
-  return res.data.result || [];
-}
-
-async function processTx(tx, walletAddress, walletInfo) {
-  // Only care about PancakeSwap interactions
-  if (tx.to?.toLowerCase() !== PANCAKE_ROUTER.toLowerCase()) return;
-  if (tx.isError !== '0') return;
-
-  const value = parseFloat(ethers.formatEther(tx.value || '0'));
-  const isBuy = value > 0.001; // BNB spent = buying a token
-
-  if (!isBuy) return; // skip sells for now (handle via position monitor)
-
-  // Get the token bought from token transfer logs
-  const tokenAddress = await getTokenFromTx(tx.hash);
-  if (!tokenAddress) return;
-
-  // Skip if already in position
-  if (openPositions.has(tokenAddress)) return;
-
-  // Skip if max positions reached
-  if (openPositions.size >= CONFIG.MAX_OPEN_POSITIONS) {
-    log(`⚠️  Max positions (${CONFIG.MAX_OPEN_POSITIONS}) reached, skipping`);
-    return;
-  }
-
-  // Skip if daily loss limit hit
-  if (dailyLossBNB >= CONFIG.MAX_DAILY_LOSS_BNB) {
-    log(`🛑 Daily loss limit reached (${dailyLossBNB} BNB), pausing trades`);
-    return;
-  }
-
-  log(`🎯 Signal detected! Wallet ${walletInfo.name} bought token ${tokenAddress}`);
-
-  // Cross-check momentum on Binance before committing
-  const momentum = await checkBinanceMomentum();
-  if (!momentum.ok) {
-    log(`⏸️  Trade blocked by momentum gate: ${momentum.reason}`);
-    await auditLog('TRADE_BLOCKED_MOMENTUM', { tokenAddress, walletAddress, reason: momentum.reason });
-    return;
-  }
-
-  // Save signal to DB
-  const signal = await prisma.incomingSignal.create({
-    data: {
-      traderId: walletInfo.traderId || await getDefaultTraderId(),
-      symbol: tokenAddress,
-      side: 'BUY',
-      rawPayload: JSON.stringify({ txHash: tx.hash, walletAddress, tokenAddress, bnbSpent: value }),
-      status: 'PENDING',
-    }
-  });
-
-  await auditLog('SIGNAL_DETECTED', { walletAddress, tokenAddress, txHash: tx.hash });
-
-  // Execute trade
-  await executeBuy(tokenAddress, signal.id, walletInfo.traderId);
-}
-
-async function getTokenFromTx(txHash) {
   try {
-    const res = await axios.get(BSCSCAN_API, {
-      params: {
-        module: 'account',
-        action: 'tokentx',
-        txhash: txHash,
-        apikey: CONFIG.BSCSCAN_API_KEY,
+    const currentBlock = await provider.getBlockNumber();
+    if (!lastScannedBlock) { lastScannedBlock = currentBlock - 5; return; }
+    if (currentBlock <= lastScannedBlock) return;
+
+    const fromBlock = lastScannedBlock + 1;
+    const toBlock   = Math.min(currentBlock, lastScannedBlock + 20); // max 20 blocks per poll
+
+    // All PancakeSwap Swap events across every pair in this range
+    const swapLogs = await provider.getLogs({ topics: [SWAP_TOPIC], fromBlock, toBlock }).catch(() => []);
+    lastScannedBlock = toBlock;
+
+    if (swapLogs.length === 0) return;
+
+    const trackedAddrs = new Set(trackedWallets.keys());
+
+    // Deduplicate tx hashes
+    const uniqueHashes = [...new Set(swapLogs.map(l => l.transactionHash))];
+
+    for (let i = 0; i < uniqueHashes.length; i += 5) {
+      const batch = uniqueHashes.slice(i, i + 5);
+      const txes = await Promise.all(batch.map(h => provider.getTransaction(h).catch(() => null)));
+      for (const tx of txes) {
+        if (!tx?.from) continue;
+        const from = tx.from.toLowerCase();
+        if (!trackedAddrs.has(from)) continue;
+        const log = swapLogs.find(l => l.transactionHash === tx.hash);
+        if (log) await processSwapEvent(log, tx, trackedWallets.get(from));
+      }
+      await sleep(100);
+    }
+  } catch (e) {
+    log(`⚠️  monitorWallets error: ${e.message}`);
+  }
+}
+
+async function processSwapEvent(swapLog, tx, walletInfo) {
+  try {
+    const coder = new ethers.AbiCoder();
+    let a0in, a1in;
+    try { [a0in, a1in] = coder.decode(['uint256','uint256','uint256','uint256'], swapLog.data); }
+    catch(e) { return; }
+
+    const bnbSpent = parseFloat(ethers.formatEther(a1in > 0n ? a1in : a0in));
+    if (bnbSpent < 0.001) return; // sell or dust — skip
+
+    const tokenAddress = await getTokenFromPair(swapLog.address);
+    if (!tokenAddress) return;
+
+    if (openPositions.has(tokenAddress)) return;
+    if (openPositions.size >= CONFIG.MAX_OPEN_POSITIONS) {
+      log(`⚠️  Max positions (${CONFIG.MAX_OPEN_POSITIONS}) reached, skipping`);
+      return;
+    }
+    if (dailyLossBNB >= CONFIG.MAX_DAILY_LOSS_BNB) {
+      log(`🛑 Daily loss limit reached (${dailyLossBNB} BNB), pausing trades`);
+      return;
+    }
+
+    log(`🎯 Signal: ${walletInfo.name} bought ${tokenAddress.slice(0,10)}... (${bnbSpent.toFixed(3)} BNB)`);
+
+    const momentum = await checkBinanceMomentum();
+    if (!momentum.ok) {
+      log(`⏸️  Blocked by momentum: ${momentum.reason}`);
+      await auditLog('TRADE_BLOCKED_MOMENTUM', { tokenAddress, walletAddress: tx.from, reason: momentum.reason });
+      return;
+    }
+
+    const signal = await prisma.incomingSignal.create({
+      data: {
+        traderId: walletInfo.traderId || await getDefaultTraderId(),
+        symbol: tokenAddress,
+        side: 'BUY',
+        rawPayload: JSON.stringify({ txHash: tx.hash, walletAddress: tx.from, tokenAddress, bnbSpent }),
+        status: 'PENDING',
       }
     });
 
-    if (res.data.status !== '1' || !res.data.result?.length) return null;
+    await auditLog('SIGNAL_DETECTED', { walletAddress: tx.from, tokenAddress, txHash: tx.hash });
+    await executeBuy(tokenAddress, signal.id, walletInfo.traderId);
+  } catch (e) {
+    log(`⚠️  processSwapEvent error: ${e.message}`);
+  }
+}
 
-    // Find the token received (not WBNB)
-    const tokenTx = res.data.result.find(t =>
-      t.contractAddress?.toLowerCase() !== WBNB.toLowerCase()
-    );
-
-    return tokenTx?.contractAddress || null;
+async function getTokenFromPair(pairAddr) {
+  const key = pairAddr.toLowerCase();
+  if (pairTokenCache.has(key)) return pairTokenCache.get(key);
+  try {
+    const PAIR_ABI_TOKENS = ['function token0() view returns (address)', 'function token1() view returns (address)'];
+    const pair = new ethers.Contract(key, PAIR_ABI_TOKENS, provider);
+    const [t0, t1] = await Promise.all([pair.token0(), pair.token1()]);
+    const token = t0.toLowerCase() === WBNB.toLowerCase() ? t1.toLowerCase() : t0.toLowerCase();
+    pairTokenCache.set(key, token);
+    return token;
   } catch (e) {
     return null;
   }
