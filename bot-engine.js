@@ -11,6 +11,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const { ethers } = require('ethers');
 const { PrismaClient } = require('@prisma/client');
+const { harvestWallets } = require('./harvest-wallets');
 
 const prisma = new PrismaClient();
 
@@ -138,6 +139,15 @@ async function init() {
   setInterval(monitorWallets, CONFIG.WALLET_POLL_MS);
   setInterval(monitorPositions, CONFIG.POSITION_POLL_MS);
   setInterval(resetDailyLoss, 60000);
+
+  // Wallet harvester — runs every 6h, first run 2 min after startup
+  setTimeout(() => {
+    harvestWallets(prisma, provider).catch(e => log(`❌ harvestWallets: ${e.message}`));
+    setInterval(
+      () => harvestWallets(prisma, provider).catch(e => log(`❌ harvestWallets: ${e.message}`)),
+      6 * 60 * 60 * 1000
+    );
+  }, 2 * 60 * 1000);
 
   log('✅ All systems running. Watching the trenches...\n');
 }
