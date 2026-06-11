@@ -19,8 +19,8 @@ const prisma = new PrismaClient();
 // CONFIG — paste your keys into .env file
 // ─────────────────────────────────────────────
 const CONFIG = {
-  BSCSCAN_API_KEY: process.env.BSCSCAN_API_KEY || 'XJSBR7BPBT4X3Z595RYXNTCJFYGC3BHTYC',
   BSC_RPC: process.env.BSC_RPC || 'https://bsc-dataseed1.binance.org/',
+  BSC_WSS: process.env.BSC_WSS || 'wss://bsc-rpc.publicnode.com',
   WALLET_PRIVATE_KEY: process.env.WALLET_PRIVATE_KEY || '',
 
   // Binance API — used for momentum cross-check before executing buys
@@ -38,9 +38,7 @@ const CONFIG = {
   MIN_BNB_24H_CHANGE: -5,   // skip if BNB down >5% in 24h
   MIN_BTC_24H_CHANGE: -8,   // skip if BTC down >8% in 24h (macro crash)
 
-  // Polling intervals (ms)
-  WALLET_POLL_MS: 15000,
-  DISCOVERY_POLL_MS: 3600000,
+  // Position monitoring interval (ms)
   POSITION_POLL_MS: 30000,
 
   // Auto-discovery params
@@ -66,7 +64,6 @@ const BINANCE_API = 'https://api.binance.com';
 const PANCAKE_ROUTER  = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
 const PANCAKE_FACTORY = '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73';
 const WBNB = '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c';
-const BSCSCAN_API = 'https://api.bscscan.com/api';
 
 const SWAP_TOPIC        = '0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822';
 const PAIR_CREATED_TOPIC = '0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9';
@@ -110,8 +107,15 @@ let openPositions = new Map();    // tokenAddress -> { buyPrice, amount, bnbSpen
 let dailyLossBNB = 0;
 let dailyPnLBNB  = 0;
 let lastDailyReset = new Date().toDateString();
-let lastScannedBlock = 0;
 const pairTokenCache = new Map(); // pairAddr -> tokenAddr
+
+// WebSocket state
+let wsProvider       = null;
+let wsConnected      = false;
+let wsLastBlock      = 0;
+let wsLastBlockTime  = 0;
+let wsReconnectDelay = 2000;
+let wsReconnectTimer = null;
 
 // ─────────────────────────────────────────────
 // INIT
@@ -140,9 +144,12 @@ async function init() {
   // Start all loops
   await refreshTraders();                                          // initial discovery + dormancy prune
   setInterval(refreshTraders, 24 * 60 * 60 * 1000);              // daily re-scan
-  setInterval(monitorWallets, CONFIG.WALLET_POLL_MS);
   setInterval(monitorPositions, CONFIG.POSITION_POLL_MS);
   setInterval(resetDailyLoss, 60000);
+
+  // WebSocket block monitoring (replaces polling)
+  await connectWebSocket();
+  startWsWatchdog();
 
   // Wallet harvester — runs every 6h, first run 2 min after startup
   setTimeout(() => {
@@ -351,42 +358,101 @@ async function discoverFreshEarlyBuyers(needed = 10) {
 }
 
 // ─────────────────────────────────────────────
-// WALLET MONITOR — watches for new buys via eth_getLogs
+// WEBSOCKET MONITOR — real-time block-by-block wallet tracking
 // ─────────────────────────────────────────────
-async function monitorWallets() {
+async function connectWebSocket() {
+  if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+
+  // Alternate between primary and fallback after repeated failures
+  const wsUrl = wsReconnectDelay > 32000 ? 'wss://bsc.callstaticrpc.com' : CONFIG.BSC_WSS;
+  log(`⚡ WebSocket connecting: ${wsUrl}`);
+
   try {
-    const currentBlock = await provider.getBlockNumber();
-    if (!lastScannedBlock) { lastScannedBlock = currentBlock - 5; return; }
-    if (currentBlock <= lastScannedBlock) return;
+    if (wsProvider) {
+      wsProvider.removeAllListeners();
+      try { wsProvider.destroy(); } catch (_) {}
+      wsProvider = null;
+    }
 
-    const fromBlock = lastScannedBlock + 1;
-    const toBlock   = Math.min(currentBlock, lastScannedBlock + 20); // max 20 blocks per poll
+    wsProvider = new ethers.WebSocketProvider(wsUrl);
 
-    // All PancakeSwap Swap events across every pair in this range
-    const swapLogs = await provider.getLogs({ topics: [SWAP_TOPIC], fromBlock, toBlock }).catch(() => []);
-    lastScannedBlock = toBlock;
+    // Verify the connection responds before marking it live
+    const connectTimeout = new Promise((_, rej) => setTimeout(() => rej(new Error('connect timeout')), 10000));
+    wsLastBlock = await Promise.race([wsProvider.getBlockNumber(), connectTimeout]);
+    wsLastBlockTime = Date.now();
+    wsConnected = true;
+    wsReconnectDelay = 2000; // reset backoff on success
 
-    if (swapLogs.length === 0) return;
+    log(`⚡ WebSocket connected | Block: ${wsLastBlock}`);
+    sendTelegram(`⚡ CopyPulse WebSocket connected — monitoring ${trackedWallets.size} wallets`).catch(() => {});
+
+    wsProvider.on('block', (blockNumber) => {
+      wsLastBlock = blockNumber;
+      wsLastBlockTime = Date.now();
+      processBlock(blockNumber).catch(e => log(`⚠️  processBlock ${blockNumber}: ${e.message}`));
+    });
+
+  } catch (e) {
+    wsConnected = false;
+    log(`❌ WebSocket failed: ${e.message}`);
+    scheduleWsReconnect();
+  }
+}
+
+function scheduleWsReconnect() {
+  if (wsReconnectTimer) return;
+  const delay = wsReconnectDelay;
+  log(`🔄 WebSocket reconnecting in ${delay / 1000}s...`);
+  sendTelegram(`⚠️ CopyPulse WebSocket disconnected — reconnecting in ${delay / 1000}s`).catch(() => {});
+  wsReconnectTimer = setTimeout(() => {
+    wsReconnectTimer = null;
+    wsReconnectDelay = Math.min(wsReconnectDelay * 2, 60000);
+    connectWebSocket();
+  }, delay);
+}
+
+function startWsWatchdog() {
+  // BSC mines ~1 block/3s. If no block in 30s, the connection is dead.
+  setInterval(() => {
+    if (wsConnected && wsLastBlockTime > 0 && Date.now() - wsLastBlockTime > 30000) {
+      log('⚠️  WebSocket stale — no block in 30s, reconnecting...');
+      wsConnected = false;
+      scheduleWsReconnect();
+    }
+  }, 15000);
+
+  // Heartbeat log every 60s
+  setInterval(() => {
+    log(`💓 Monitoring ${trackedWallets.size} wallets | Last block: ${wsLastBlock} | WebSocket: ${wsConnected ? 'connected' : 'disconnected'}`);
+  }, 60000);
+}
+
+async function processBlock(blockNumber) {
+  try {
+    const block = await provider.getBlock(blockNumber, true);
+    if (!block?.transactions?.length) return;
 
     const trackedAddrs = new Set(trackedWallets.keys());
+    const routerLower  = PANCAKE_ROUTER.toLowerCase();
 
-    // Deduplicate tx hashes
-    const uniqueHashes = [...new Set(swapLogs.map(l => l.transactionHash))];
+    for (const tx of block.transactions) {
+      if (!tx?.from || !tx?.to) continue;
+      const from = tx.from.toLowerCase();
+      if (!trackedAddrs.has(from)) continue;
+      if (tx.to.toLowerCase() !== routerLower) continue;
 
-    for (let i = 0; i < uniqueHashes.length; i += 5) {
-      const batch = uniqueHashes.slice(i, i + 5);
-      const txes = await Promise.all(batch.map(h => provider.getTransaction(h).catch(() => null)));
-      for (const tx of txes) {
-        if (!tx?.from) continue;
-        const from = tx.from.toLowerCase();
-        if (!trackedAddrs.has(from)) continue;
-        const log = swapLogs.find(l => l.transactionHash === tx.hash);
-        if (log) await processSwapEvent(log, tx, trackedWallets.get(from));
-      }
-      await sleep(100);
+      // Get receipt and find the Swap event
+      const receipt = await provider.getTransactionReceipt(tx.hash).catch(() => null);
+      if (!receipt?.logs) continue;
+
+      const swapLog = receipt.logs.find(l => l.topics[0] === SWAP_TOPIC);
+      if (!swapLog) continue;
+
+      const walletInfo = trackedWallets.get(from);
+      await processSwapEvent(swapLog, tx, walletInfo);
     }
   } catch (e) {
-    log(`⚠️  monitorWallets error: ${e.message}`);
+    log(`⚠️  processBlock ${blockNumber}: ${e.message}`);
   }
 }
 
@@ -800,7 +866,7 @@ async function tokenSafetyCheck(tokenAddress) {
     log(`⚠️  [DEXSCREENER] check failed (${e.message}) — skipping`);
   }
 
-  // 5. Top holder concentration (BSCScan — best-effort, fail open if API unavailable)
+  // 5. Zero-supply check (paranoia guard — fail fast before executing a trade)
   try {
     const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
     const supply = await tokenContract.totalSupply();
@@ -808,25 +874,9 @@ async function tokenSafetyCheck(tokenAddress) {
       log(`🚫 [SUPPLY] zero supply`);
       return { ok: false, reason: 'Zero total supply' };
     }
-
-    const holdersRes = await axios.get(BSCSCAN_API, {
-      params: { module: 'token', action: 'tokenholderlist', contractaddress: tokenAddress, page: 1, offset: 10, apikey: CONFIG.BSCSCAN_API_KEY },
-      timeout: 5000,
-    });
-
-    if (holdersRes.data.status === '1' && holdersRes.data.result?.length) {
-      const topHolder = holdersRes.data.result[0];
-      const decimals = await tokenContract.decimals();
-      const topPct = parseFloat(ethers.formatUnits(topHolder.TokenHolderQuantity || '0', decimals)) /
-                     parseFloat(ethers.formatUnits(supply, decimals)) * 100;
-      if (topPct > 50) {
-        log(`🚫 [TOP_HOLDER] ${topPct.toFixed(0)}% held by single address`);
-        return { ok: false, reason: `Top holder owns ${topPct.toFixed(0)}% — rug risk` };
-      }
-      log(`✅ [TOP_HOLDER] top holder: ${topPct.toFixed(1)}%`);
-    }
+    log(`✅ [SUPPLY] totalSupply OK`);
   } catch (e) {
-    log(`⚠️  [TOP_HOLDER] check failed (${e.message}) — skipping`);
+    log(`⚠️  [SUPPLY] check failed (${e.message}) — skipping`);
   }
 
   log(`✅ [SAFETY] ${tokenAddress} passed all checks`);
