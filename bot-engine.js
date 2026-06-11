@@ -52,6 +52,10 @@ const CONFIG = {
   // SELF_TRADE=true  → run all safety checks and execute real buys
   // SELF_TRADE=false → monitor-only (log signals, never trade)
   SELF_TRADE: process.env.SELF_TRADE === 'true',
+
+  // Telegram notifications
+  TELEGRAM_TOKEN:   process.env.TELEGRAM_TOKEN   || '8917799761:AAHvE2LdQ85sMs_wNDNVVMBIYzeTXG3Cgkg',
+  TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '6488244344',
 };
 
 // ─────────────────────────────────────────────
@@ -150,6 +154,7 @@ async function init() {
   }, 2 * 60 * 1000);
 
   log('✅ All systems running. Watching the trenches...\n');
+  await sendTelegram(`🚀 CopyPulse started — tracking ${trackedWallets.size} wallets`);
 }
 
 // ─────────────────────────────────────────────
@@ -409,6 +414,7 @@ async function processSwapEvent(swapLog, tx, walletInfo) {
     }
 
     log(`🎯 Signal: ${walletInfo.name} bought ${tokenAddress.slice(0,10)}... (${bnbSpent.toFixed(3)} BNB)`);
+    sendTelegram(`🎯 Signal: ${walletInfo.name} bought ${tokenAddress.slice(0, 10)}...`).catch(() => {});
 
     const momentum = await checkBinanceMomentum();
     if (!momentum.ok) {
@@ -428,7 +434,7 @@ async function processSwapEvent(swapLog, tx, walletInfo) {
     });
 
     await auditLog('SIGNAL_DETECTED', { walletAddress: tx.from, tokenAddress, txHash: tx.hash });
-    await executeBuy(tokenAddress, signal.id, walletInfo.traderId);
+    await executeBuy(tokenAddress, signal.id, walletInfo.traderId, walletInfo.name);
   } catch (e) {
     log(`⚠️  processSwapEvent error: ${e.message}`);
   }
@@ -452,7 +458,7 @@ async function getTokenFromPair(pairAddr) {
 // ─────────────────────────────────────────────
 // TRADE EXECUTOR
 // ─────────────────────────────────────────────
-async function executeBuy(tokenAddress, signalId, traderId) {
+async function executeBuy(tokenAddress, signalId, traderId, traderName = 'Unknown') {
   if (!wallet || !CONFIG.SELF_TRADE) {
     const reason = !wallet ? 'No WALLET_PRIVATE_KEY set' : 'SELF_TRADE=false (monitor-only mode)';
     log(`📋 [MONITOR MODE] Signal: ${tokenAddress} — ${reason}`);
@@ -468,6 +474,7 @@ async function executeBuy(tokenAddress, signalId, traderId) {
     if (!safe.ok) {
       log(`🚫 Token ${tokenAddress} failed safety check: ${safe.reason}`);
       await prisma.incomingSignal.update({ where: { id: signalId }, data: { status: 'SKIPPED', errorMessage: safe.reason } });
+      sendTelegram(`🚫 Skipped ${tokenAddress.slice(0, 10)}... — ${safe.reason}`).catch(() => {});
       return;
     }
 
@@ -500,6 +507,8 @@ async function executeBuy(tokenAddress, signalId, traderId) {
     const tokenBalance = await tokenContract.balanceOf(wallet.address);
     const decimals = await tokenContract.decimals();
     const symbol = await tokenContract.symbol();
+
+    sendTelegram(`🟢 BUY — ${symbol}\nWallet: ${traderName}\nAmount: ${CONFIG.MAX_TRADE_BNB} BNB\nTx: ${tx.hash}`).catch(() => {});
     const tokenAmount = parseFloat(ethers.formatUnits(tokenBalance, decimals));
 
     // Get buy price
@@ -592,6 +601,7 @@ async function executeSell(tokenAddress, position, reason) {
     const pnlSign = pnlBNB >= 0 ? '+' : '';
     const todaySign = dailyPnLBNB >= 0 ? '+' : '';
     log(`💰 PnL: ${pnlSign}${pnlBNB.toFixed(4)} BNB (${pnlSign}${pnlPct.toFixed(1)}%) on ${position.symbol} | Reason: ${reason} | Total today: ${todaySign}${dailyPnLBNB.toFixed(4)} BNB`);
+    sendTelegram(`🔴 SELL — ${position.symbol}\nPnL: ${pnlSign}${pnlBNB.toFixed(3)} BNB (${pnlSign}${pnlPct.toFixed(1)}%)\nReason: ${reason}`).catch(() => {});
 
     await prisma.tradeResult.create({
       data: {
@@ -927,6 +937,19 @@ function sleep(ms) {
 function log(msg) {
   const ts = new Date().toISOString().slice(11, 19);
   console.log(`[${ts}] ${msg}`);
+}
+
+async function sendTelegram(msg) {
+  if (!CONFIG.TELEGRAM_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) return;
+  try {
+    await axios.post(
+      `https://api.telegram.org/bot${CONFIG.TELEGRAM_TOKEN}/sendMessage`,
+      { chat_id: CONFIG.TELEGRAM_CHAT_ID, text: msg },
+      { timeout: 5000 }
+    );
+  } catch (e) {
+    log(`⚠️  Telegram send failed: ${e.message}`);
+  }
 }
 
 // ─────────────────────────────────────────────
