@@ -20,7 +20,8 @@ const prisma = new PrismaClient();
 // ─────────────────────────────────────────────
 const CONFIG = {
   BSC_RPC: process.env.BSC_RPC || 'https://bsc-dataseed1.binance.org/',
-  BSC_WSS: process.env.BSC_WSS || 'wss://bsc-rpc.publicnode.com',
+  BSC_WSS: process.env.QUICKNODE_WSS || 'wss://fluent-quaint-night.bsc.quiknode.pro/d99bf44ca3a1432d3b3a975cdb6b3d4b3ca013ad/',
+  BSC_WSS_FALLBACK: 'wss://bsc-rpc.publicnode.com',
   WALLET_PRIVATE_KEY: process.env.WALLET_PRIVATE_KEY || '',
 
   // Binance API — used for momentum cross-check before executing buys
@@ -110,12 +111,13 @@ let lastDailyReset = new Date().toDateString();
 const pairTokenCache = new Map(); // pairAddr -> tokenAddr
 
 // WebSocket state
-let wsProvider       = null;
-let wsConnected      = false;
-let wsLastBlock      = 0;
-let wsLastBlockTime  = 0;
-let wsReconnectDelay = 2000;
-let wsReconnectTimer = null;
+let wsProvider        = null;
+let wsConnected       = false;
+let wsLastBlock       = 0;
+let wsLastBlockTime   = 0;
+let wsReconnectDelay  = 2000;
+let wsReconnectTimer  = null;
+let wsDisconnectTime  = 0;
 
 // ─────────────────────────────────────────────
 // INIT
@@ -363,8 +365,8 @@ async function discoverFreshEarlyBuyers(needed = 10) {
 async function connectWebSocket() {
   if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
 
-  // Alternate between primary and fallback after repeated failures
-  const wsUrl = wsReconnectDelay > 32000 ? 'wss://bsc.callstaticrpc.com' : CONFIG.BSC_WSS;
+  // Use fallback after repeated failures (backoff > 32s means ≥4 failed attempts)
+  const wsUrl = wsReconnectDelay > 32000 ? CONFIG.BSC_WSS_FALLBACK : CONFIG.BSC_WSS;
   log(`⚡ WebSocket connecting: ${wsUrl}`);
 
   try {
@@ -382,6 +384,7 @@ async function connectWebSocket() {
     wsLastBlockTime = Date.now();
     wsConnected = true;
     wsReconnectDelay = 2000; // reset backoff on success
+    wsDisconnectTime = 0;
 
     log(`⚡ WebSocket connected | Block: ${wsLastBlock}`);
     sendTelegram(`⚡ CopyPulse WebSocket connected — monitoring ${trackedWallets.size} wallets`).catch(() => {});
@@ -401,9 +404,13 @@ async function connectWebSocket() {
 
 function scheduleWsReconnect() {
   if (wsReconnectTimer) return;
+  if (wsDisconnectTime === 0) wsDisconnectTime = Date.now();
   const delay = wsReconnectDelay;
   log(`🔄 WebSocket reconnecting in ${delay / 1000}s...`);
-  sendTelegram(`⚠️ CopyPulse WebSocket disconnected — reconnecting in ${delay / 1000}s`).catch(() => {});
+  // Only alert Telegram once the outage has lasted more than 60 seconds
+  if (Date.now() - wsDisconnectTime >= 60000) {
+    sendTelegram(`⚠️ CopyPulse WebSocket disconnected — reconnecting in ${delay / 1000}s`).catch(() => {});
+  }
   wsReconnectTimer = setTimeout(() => {
     wsReconnectTimer = null;
     wsReconnectDelay = Math.min(wsReconnectDelay * 2, 60000);
