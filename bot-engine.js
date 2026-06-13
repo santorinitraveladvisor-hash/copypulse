@@ -100,10 +100,16 @@ const PAIR_ABI    = ['function getReserves() view returns (uint112,uint112,uint3
 // ─────────────────────────────────────────────
 // FOUR.MEME CONSTANTS
 // ─────────────────────────────────────────────
-const FOUR_MEME_CONTRACT     = '0x5c952063c7fc8610FFDB798152D69F0B9550762b';
-// keccak256("TokenPurchase(address,address,uint256,uint256)")
-// topics[1]=buyer (indexed), topics[2]=token (indexed), data=[bnbAmount,tokenAmount]
-const FOUR_MEME_PURCHASE_TOPIC = ethers.id('TokenPurchase(address,address,uint256,uint256)');
+const FOUR_MEME_CONTRACT = '0x5c952063c7fc8610FFDB798152D69F0B9550762b';
+// Verified against live contract logs (publicnode RPC, block ~104009988).
+// ALL 8 parameters are non-indexed — topics.length === 1 on every emission.
+// Signature: TokenPurchase(address buyer, address token,
+//   uint256 p2, uint256 tokenAmount, uint256 bnbReserve, uint256 bnbPaid,
+//   uint256 p6, uint256 p7)
+// Buyer  = ABI data[0], Token = data[1], BNB paid by buyer = data[5].
+// keccak256("TokenPurchase(address,address,uint256,uint256,uint256,uint256,uint256,uint256)")
+// = 0x7db52723a3b2cdd6164364b3b766e65e540d7be48ffa89582956d8eaebe62942
+const FOUR_MEME_PURCHASE_TOPIC = ethers.id('TokenPurchase(address,address,uint256,uint256,uint256,uint256,uint256,uint256)');
 
 // ─────────────────────────────────────────────
 // STATE
@@ -564,14 +570,24 @@ async function getTokenFromPair(pairAddr) {
 // ─────────────────────────────────────────────
 async function processFourMemeEvent(eventLog) {
   try {
-    if (eventLog.topics.length < 3) return;
-    const buyer        = ('0x' + eventLog.topics[1].slice(26)).toLowerCase();
-    const tokenAddress = ('0x' + eventLog.topics[2].slice(26)).toLowerCase();
-
+    // ALL 8 params are non-indexed — topics.length is always 1.
+    // Layout: buyer(address), token(address), p2(uint256), tokenAmount(uint256),
+    //         bnbReserve(uint256), bnbPaid(uint256), p6(uint256), p7(uint256)
+    // Verified against live contract logs on BSC (block ~104009988).
     const coder = new ethers.AbiCoder();
-    let bnbAmount = 0n;
-    try { [bnbAmount] = coder.decode(['uint256', 'uint256'], eventLog.data); } catch (_) {}
-    const bnbSpent = parseFloat(ethers.formatEther(bnbAmount));
+    let decoded;
+    try {
+      decoded = coder.decode(
+        ['address','address','uint256','uint256','uint256','uint256','uint256','uint256'],
+        eventLog.data
+      );
+    } catch (_) { return; }
+
+    const buyer        = decoded[0].toLowerCase();
+    const tokenAddress = decoded[1].toLowerCase();
+    const bnbSpent     = parseFloat(ethers.formatEther(decoded[5])); // data[5] = BNB paid by buyer
+
+    if (bnbSpent < 0.001) return; // dust
 
     // Path 1: KOL signal — tracked wallet made the buy
     if (trackedWallets.has(buyer)) {
