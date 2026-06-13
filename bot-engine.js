@@ -98,6 +98,14 @@ const FACTORY_ABI = ['function getPair(address,address) view returns (address)']
 const PAIR_ABI    = ['function getReserves() view returns (uint112,uint112,uint32)'];
 
 // ─────────────────────────────────────────────
+// FOUR.MEME CONSTANTS
+// ─────────────────────────────────────────────
+const FOUR_MEME_CONTRACT     = '0x5c952063c7fc8610FFDB798152D69F0B9550762b';
+// keccak256("TokenPurchase(address,address,uint256,uint256)")
+// topics[1]=buyer (indexed), topics[2]=token (indexed), data=[bnbAmount,tokenAmount]
+const FOUR_MEME_PURCHASE_TOPIC = ethers.id('TokenPurchase(address,address,uint256,uint256)');
+
+// ─────────────────────────────────────────────
 // STATE
 // ─────────────────────────────────────────────
 let provider;
@@ -108,7 +116,8 @@ let openPositions = new Map();    // tokenAddress -> { buyPrice, amount, bnbSpen
 let dailyLossBNB = 0;
 let dailyPnLBNB  = 0;
 let lastDailyReset = new Date().toDateString();
-const pairTokenCache = new Map(); // pairAddr -> tokenAddr
+const pairTokenCache    = new Map(); // pairAddr -> tokenAddr
+const fourMemeConsensus = new Map(); // tokenAddr -> { buyers: Set<address>, firstSeen: ms }
 
 // WebSocket state
 let wsProvider        = null;
@@ -148,6 +157,14 @@ async function init() {
   setInterval(refreshTraders, 24 * 60 * 60 * 1000);              // daily re-scan
   setInterval(monitorPositions, CONFIG.POSITION_POLL_MS);
   setInterval(resetDailyLoss, 60000);
+
+  // Prune stale four.meme consensus entries every 10 min
+  setInterval(() => {
+    const cutoff = Date.now() - 2 * 60 * 1000;
+    for (const [token, entry] of fourMemeConsensus.entries()) {
+      if (entry.firstSeen < cutoff) fourMemeConsensus.delete(token);
+    }
+  }, 10 * 60 * 1000);
 
   // WebSocket block monitoring (replaces polling)
   await connectWebSocket();
@@ -395,6 +412,13 @@ async function connectWebSocket() {
       processBlock(blockNumber).catch(e => log(`⚠️  processBlock ${blockNumber}: ${e.message}`));
     });
 
+    // four.meme TokenPurchase log subscription
+    wsProvider.on(
+      { address: FOUR_MEME_CONTRACT, topics: [FOUR_MEME_PURCHASE_TOPIC] },
+      (eventLog) => processFourMemeEvent(eventLog).catch(e => log(`⚠️  processFourMemeEvent: ${e.message}`))
+    );
+    log('⚡ Subscribed to four.meme TokenPurchase events');
+
   } catch (e) {
     wsConnected = false;
     log(`❌ WebSocket failed: ${e.message}`);
@@ -470,11 +494,18 @@ async function processSwapEvent(swapLog, tx, walletInfo) {
     try { [a0in, a1in] = coder.decode(['uint256','uint256','uint256','uint256'], swapLog.data); }
     catch(e) { return; }
 
-    const bnbSpent = parseFloat(ethers.formatEther(a1in > 0n ? a1in : a0in));
-    if (bnbSpent < 0.001) return; // sell or dust — skip
-
+    // Resolve token first so we know which side of the pair WBNB sits on.
+    // PancakeSwap sorts token0 < token1 by address, so:
+    //   token < WBNB  →  token=token0, WBNB=token1  →  bnbIn = a1in
+    //   token > WBNB  →  WBNB=token0, token=token1  →  bnbIn = a0in
     const tokenAddress = await getTokenFromPair(swapLog.address);
     if (!tokenAddress) return;
+
+    const wbnbIsToken1 = tokenAddress.toLowerCase() < WBNB.toLowerCase();
+    const bnbIn = wbnbIsToken1 ? a1in : a0in;
+    if (bnbIn === 0n) return; // sell (WBNB going out, not in)
+    const bnbSpent = parseFloat(ethers.formatEther(bnbIn));
+    if (bnbSpent < 0.001) return; // dust
 
     if (openPositions.has(tokenAddress)) return;
     if (openPositions.size >= CONFIG.MAX_OPEN_POSITIONS) {
@@ -529,8 +560,140 @@ async function getTokenFromPair(pairAddr) {
 }
 
 // ─────────────────────────────────────────────
+// FOUR.MEME EVENT PROCESSOR
+// ─────────────────────────────────────────────
+async function processFourMemeEvent(eventLog) {
+  try {
+    if (eventLog.topics.length < 3) return;
+    const buyer        = ('0x' + eventLog.topics[1].slice(26)).toLowerCase();
+    const tokenAddress = ('0x' + eventLog.topics[2].slice(26)).toLowerCase();
+
+    const coder = new ethers.AbiCoder();
+    let bnbAmount = 0n;
+    try { [bnbAmount] = coder.decode(['uint256', 'uint256'], eventLog.data); } catch (_) {}
+    const bnbSpent = parseFloat(ethers.formatEther(bnbAmount));
+
+    // Path 1: KOL signal — tracked wallet made the buy
+    if (trackedWallets.has(buyer)) {
+      const walletInfo = trackedWallets.get(buyer);
+      log(`🎯 [4.meme] ${walletInfo.name} bought ${tokenAddress.slice(0, 10)}... (${bnbSpent.toFixed(3)} BNB)`);
+      await handleFourMemeKolSignal(tokenAddress, buyer, walletInfo, bnbSpent);
+    }
+
+    // Path 2: consensus — count all buyers of the same token within 2 min
+    const now = Date.now();
+    let entry = fourMemeConsensus.get(tokenAddress);
+    if (!entry || now - entry.firstSeen > 2 * 60 * 1000) {
+      entry = { buyers: new Set(), firstSeen: now };
+      fourMemeConsensus.set(tokenAddress, entry);
+    }
+    entry.buyers.add(buyer);
+
+    if (entry.buyers.size >= 3) {
+      const buyerCount = entry.buyers.size;
+      fourMemeConsensus.delete(tokenAddress); // prevent re-triggering on the same wave
+      log(`🔥 [4.meme Consensus] ${buyerCount} wallets bought ${tokenAddress.slice(0, 10)}... in 2min`);
+      await handleFourMemeConsensusSignal(tokenAddress, buyerCount);
+    }
+  } catch (e) {
+    log(`⚠️  processFourMemeEvent: ${e.message}`);
+  }
+}
+
+async function handleFourMemeKolSignal(tokenAddress, buyerAddr, walletInfo, bnbSpent) {
+  if (openPositions.has(tokenAddress)) return;
+  if (openPositions.size >= CONFIG.MAX_OPEN_POSITIONS) {
+    log(`⚠️  Max positions reached, skipping [4.meme KOL]`);
+    return;
+  }
+  if (dailyLossBNB >= CONFIG.MAX_DAILY_LOSS_BNB) {
+    log(`🛑 Daily loss limit reached, skipping [4.meme KOL]`);
+    return;
+  }
+
+  sendTelegram(`🎯 [4.meme] ${walletInfo.name} bought ${tokenAddress.slice(0, 10)}...`).catch(() => {});
+
+  const momentum = await checkBinanceMomentum();
+  if (!momentum.ok) {
+    log(`⏸️  Blocked by momentum: ${momentum.reason}`);
+    await auditLog('TRADE_BLOCKED_MOMENTUM', { source: '4.meme', tokenAddress, walletAddress: buyerAddr, reason: momentum.reason });
+    return;
+  }
+
+  const signal = await prisma.incomingSignal.create({
+    data: {
+      traderId:   walletInfo.traderId || await getDefaultTraderId(),
+      symbol:     tokenAddress,
+      side:       'BUY',
+      rawPayload: JSON.stringify({ source: '4.meme', buyerAddress: buyerAddr, tokenAddress, bnbSpent }),
+      status:     'PENDING',
+    }
+  });
+  await auditLog('SIGNAL_DETECTED', { source: '4.meme', walletAddress: buyerAddr, tokenAddress });
+  await executeBuy(tokenAddress, signal.id, walletInfo.traderId, walletInfo.name);
+}
+
+async function handleFourMemeConsensusSignal(tokenAddress, buyerCount) {
+  if (openPositions.has(tokenAddress)) return;
+  if (openPositions.size >= CONFIG.MAX_OPEN_POSITIONS) {
+    log(`⚠️  Max positions reached, skipping [4.meme consensus]`);
+    return;
+  }
+  if (dailyLossBNB >= CONFIG.MAX_DAILY_LOSS_BNB) {
+    log(`🛑 Daily loss limit reached, skipping [4.meme consensus]`);
+    return;
+  }
+
+  sendTelegram(`🔥 [4.meme Consensus] ${buyerCount} wallets → ${tokenAddress.slice(0, 10)}...`).catch(() => {});
+
+  const momentum = await checkBinanceMomentum();
+  if (!momentum.ok) {
+    log(`⏸️  Blocked by momentum: ${momentum.reason}`);
+    await auditLog('TRADE_BLOCKED_MOMENTUM', { source: '4.meme-consensus', tokenAddress, buyerCount, reason: momentum.reason });
+    return;
+  }
+
+  const traderId = await getDefaultTraderId();
+  const signal = await prisma.incomingSignal.create({
+    data: {
+      traderId,
+      symbol:     tokenAddress,
+      side:       'BUY',
+      rawPayload: JSON.stringify({ source: '4.meme-consensus', buyerCount, tokenAddress }),
+      status:     'PENDING',
+    }
+  });
+  await auditLog('SIGNAL_DETECTED', { source: '4.meme-consensus', tokenAddress, buyerCount });
+  await executeBuy(tokenAddress, signal.id, traderId, `4.meme-${buyerCount}x`);
+}
+
+// ─────────────────────────────────────────────
 // TRADE EXECUTOR
 // ─────────────────────────────────────────────
+async function getDynamicGasPrice() {
+  try {
+    const feeData = await provider.getFeeData();
+    const base = feeData.gasPrice ?? ethers.parseUnits('5', 'gwei');
+    return base * 120n / 100n; // +20% to beat frontrunners
+  } catch (_) {
+    return ethers.parseUnits('6', 'gwei'); // safe fallback
+  }
+}
+
+async function getBnbAmountForUsd(usdAmount) {
+  try {
+    const ticker = await binanceGet('/api/v3/ticker/price', { symbol: 'BNBUSDT' });
+    const bnbPrice = parseFloat(ticker.price);
+    if (!bnbPrice || bnbPrice <= 0) throw new Error('invalid BNB price');
+    const bnb = usdAmount / bnbPrice;
+    log(`💵 Trade size: $${usdAmount} = ${bnb.toFixed(6)} BNB (@$${bnbPrice.toFixed(2)})`);
+    return bnb;
+  } catch (e) {
+    log(`⚠️  BNB price fetch failed (${e.message}) — falling back to CONFIG.MAX_TRADE_BNB`);
+    return CONFIG.MAX_TRADE_BNB;
+  }
+}
+
 async function executeBuy(tokenAddress, signalId, traderId, traderName = 'Unknown') {
   if (!wallet || !CONFIG.SELF_TRADE) {
     const reason = !wallet ? 'No WALLET_PRIVATE_KEY set' : 'SELF_TRADE=false (monitor-only mode)';
@@ -551,7 +714,8 @@ async function executeBuy(tokenAddress, signalId, traderId, traderName = 'Unknow
       return;
     }
 
-    const bnbAmount = ethers.parseEther(CONFIG.MAX_TRADE_BNB.toString());
+    const tradeBnb = await getBnbAmountForUsd(5); // $5 USD worth of BNB
+    const bnbAmount = ethers.parseEther(tradeBnb.toFixed(8));
     const path = [WBNB, tokenAddress];
     const deadline = Math.floor(Date.now() / 1000) + 60 * 5; // 5 min
 
@@ -560,14 +724,14 @@ async function executeBuy(tokenAddress, signalId, traderId, traderName = 'Unknow
     const expectedOut = amounts[1];
     const minOut = expectedOut * 85n / 100n; // 15% slippage tolerance
 
-    log(`💰 Buying token ${tokenAddress} with ${CONFIG.MAX_TRADE_BNB} BNB...`);
+    log(`💰 Buying token ${tokenAddress} with ${tradeBnb.toFixed(6)} BNB ($5)...`);
 
     const tx = await router.swapExactETHForTokensSupportingFeeOnTransferTokens(
       minOut,
       path,
       wallet.address,
       deadline,
-      { value: bnbAmount, gasLimit: 300000, gasPrice: ethers.parseUnits('5', 'gwei') }
+      { value: bnbAmount, gasLimit: 300000, gasPrice: await getDynamicGasPrice() }
     );
 
     const receipt = await tx.wait();
@@ -581,18 +745,18 @@ async function executeBuy(tokenAddress, signalId, traderId, traderName = 'Unknow
     const decimals = await tokenContract.decimals();
     const symbol = await tokenContract.symbol();
 
-    sendTelegram(`🟢 BUY — ${symbol}\nWallet: ${traderName}\nAmount: ${CONFIG.MAX_TRADE_BNB} BNB\nTx: ${tx.hash}`).catch(() => {});
+    sendTelegram(`🟢 BUY — ${symbol}\nWallet: ${traderName}\nAmount: ${tradeBnb.toFixed(6)} BNB ($5)\nTx: ${tx.hash}`).catch(() => {});
     const tokenAmount = parseFloat(ethers.formatUnits(tokenBalance, decimals));
 
     // Get buy price
-    const currentPrice = CONFIG.MAX_TRADE_BNB / tokenAmount;
+    const currentPrice = tradeBnb / tokenAmount;
 
     // Track open position
     openPositions.set(tokenAddress, {
       symbol,
       buyPrice: currentPrice,
       tokenAmount,
-      bnbSpent: CONFIG.MAX_TRADE_BNB,
+      bnbSpent: tradeBnb,
       entryTime: Date.now(),
       signalId,
       traderId,
@@ -620,7 +784,7 @@ async function executeBuy(tokenAddress, signalId, traderId, traderName = 'Unknow
     });
 
     await prisma.incomingSignal.update({ where: { id: signalId }, data: { status: 'EXECUTED' } });
-    await auditLog('BUY_EXECUTED', { tokenAddress, symbol, bnbSpent: CONFIG.MAX_TRADE_BNB, txHash: tx.hash });
+    await auditLog('BUY_EXECUTED', { tokenAddress, symbol, bnbSpent: tradeBnb, txHash: tx.hash });
 
   } catch (e) {
     log(`❌ Buy failed for ${tokenAddress}: ${e.message}`);
@@ -647,7 +811,8 @@ async function executeSell(tokenAddress, position, reason) {
 
     const path = [tokenAddress, WBNB];
     const deadline = Math.floor(Date.now() / 1000) + 60 * 5;
-    const minBNB = 0n; // accept any amount (trench tokens are volatile)
+    const expectedOut = await router.getAmountsOut(tokenBalance, path).catch(() => [0n, 0n]);
+    const minBNB = expectedOut[1] * 85n / 100n; // 15% slippage tolerance
 
     log(`📤 Selling ${position.symbol} (reason: ${reason})...`);
 
@@ -657,7 +822,7 @@ async function executeSell(tokenAddress, position, reason) {
       path,
       wallet.address,
       deadline,
-      { gasLimit: 300000, gasPrice: ethers.parseUnits('5', 'gwei') }
+      { gasLimit: 300000, gasPrice: await getDynamicGasPrice() }
     );
 
     await tx.wait();
