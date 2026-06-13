@@ -32,9 +32,9 @@ export async function GET() {
     prisma.trader.count({ where: { isActive: true } }).catch(() => 0),
     prisma.copiedOrder.count().catch(() => 0),
     getBnbBalance(),
-    fetch('https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT')
+    fetch('https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd')
       .then(r => r.json())
-      .then((d: { price: string }) => parseFloat(d.price))
+      .then((d: { binancecoin: { usd: number } }) => d.binancecoin.usd)
       .catch(() => null),
   ]);
 
