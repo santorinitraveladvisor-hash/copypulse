@@ -2,19 +2,39 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { JsonRpcProvider, formatEther } from 'ethers';
 
-const WALLET = '0xD7D4E440b6E99d097C061cb53639D404d421Ff6B';
-const BSC_RPC = 'https://bsc-dataseed1.binance.org/';
+export const dynamic = 'force-dynamic';
+
+const WALLET  = '0xD7D4E440b6E99d097C061cb53639D404d421Ff6B';
+const BSC_RPCS = [
+  'https://bsc-dataseed1.binance.org/',
+  'https://bsc-rpc.publicnode.com',
+];
+
+async function getBnbBalance(): Promise<number | null> {
+  for (const rpc of BSC_RPCS) {
+    try {
+      const balance = await new JsonRpcProvider(rpc).getBalance(WALLET);
+      const bnb = parseFloat(formatEther(balance));
+      if (bnb > 0) return bnb;
+    } catch (_) { /* try next */ }
+  }
+  // All RPCs returned 0 or failed — return the last known 0 if any succeeded
+  try {
+    const balance = await new JsonRpcProvider(BSC_RPCS[0]).getBalance(WALLET);
+    return parseFloat(formatEther(balance));
+  } catch (_) {
+    return null;
+  }
+}
 
 export async function GET() {
   const [traderCount, orderCount, bnbRaw, bnbPrice] = await Promise.all([
     prisma.trader.count({ where: { isActive: true } }).catch(() => 0),
     prisma.copiedOrder.count().catch(() => 0),
-    new JsonRpcProvider(BSC_RPC).getBalance(WALLET)
-      .then(b => parseFloat(formatEther(b)))
-      .catch(() => null),
+    getBnbBalance(),
     fetch('https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT')
       .then(r => r.json())
-      .then(d => parseFloat(d.price))
+      .then((d: { price: string }) => parseFloat(d.price))
       .catch(() => null),
   ]);
 
