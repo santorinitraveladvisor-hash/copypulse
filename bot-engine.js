@@ -19,7 +19,7 @@ const prisma = new PrismaClient();
 // CONFIG — paste your keys into .env file
 // ─────────────────────────────────────────────
 const CONFIG = {
-  BSC_RPC: process.env.BSC_RPC || 'https://bsc-dataseed1.binance.org/',
+  BSC_RPC: process.env.BSC_RPC || 'https://bsc-rpc.publicnode.com',
   BSC_WSS: process.env.QUICKNODE_WSS || 'wss://fluent-quaint-night.bsc.quiknode.pro/d99bf44ca3a1432d3b3a975cdb6b3d4b3ca013ad/',
   BSC_WSS_FALLBACK: 'wss://bsc-rpc.publicnode.com',
   WALLET_PRIVATE_KEY: process.env.WALLET_PRIVATE_KEY || '',
@@ -140,10 +140,11 @@ let wsDisconnectTime  = 0;
 async function init() {
   log('🚀 CopyPulse Engine Starting...');
 
-  // Connect to BSC
-  provider = new ethers.JsonRpcProvider(CONFIG.BSC_RPC);
-  const network = await provider.getNetwork();
-  log(`✅ Connected to BSC (chainId: ${network.chainId})`);
+  // Connect to BSC — staticNetwork avoids ethers' background chain-ID polling
+  // that spams "failed to detect network" retries when the RPC is slow.
+  const bscNetwork = new ethers.Network('bnb', 56);
+  provider = new ethers.JsonRpcProvider(CONFIG.BSC_RPC, bscNetwork, { staticNetwork: bscNetwork });
+  log(`✅ Connected to BSC via ${CONFIG.BSC_RPC}`);
 
   // Setup wallet
   if (!CONFIG.WALLET_PRIVATE_KEY) {
@@ -206,6 +207,8 @@ async function loadWalletsFromDB() {
       log(`📌 Tracking manual wallet: ${t.name} (${t.walletAddress})`);
     }
   }
+  // Rebuild Swap event subscription with the updated wallet list
+  resubscribeSwaps();
 }
 
 // ─────────────────────────────────────────────
@@ -383,8 +386,53 @@ async function discoverFreshEarlyBuyers(needed = 10) {
 }
 
 // ─────────────────────────────────────────────
-// WEBSOCKET MONITOR — real-time block-by-block wallet tracking
+// WEBSOCKET MONITOR — event-based Swap log subscriptions
 // ─────────────────────────────────────────────
+
+// Build a log filter for PancakeSwap Swap events where topics[2] (the indexed
+// `to` field) matches any tracked wallet. This fires only when a tracked wallet
+// receives tokens — no full-block fetching needed.
+function buildSwapFilter() {
+  const addrs = [...trackedWallets.keys()];
+  if (addrs.length === 0) return null;
+  const padded = addrs.map(a => '0x' + a.replace('0x', '').padStart(64, '0'));
+  return { topics: [SWAP_TOPIC, null, padded] };
+}
+
+// Register all WS event subscriptions on the current wsProvider.
+// Safe to call at any time — no-ops when wsProvider is not yet live.
+// Called on initial connect and again after the tracked-wallet list changes.
+function resubscribeSwaps() {
+  if (!wsProvider || !wsConnected) return;
+  wsProvider.removeAllListeners();
+
+  // Minimal block listener — watchdog heartbeat only, no full-block fetch
+  wsProvider.on('block', (blockNumber) => {
+    wsLastBlock = blockNumber;
+    wsLastBlockTime = Date.now();
+  });
+
+  // Swap events filtered to tracked wallet addresses in topics[2]
+  const filter = buildSwapFilter();
+  if (filter) {
+    wsProvider.on(filter, (eventLog) => {
+      const recipient = ('0x' + eventLog.topics[2].slice(26)).toLowerCase();
+      const walletInfo = trackedWallets.get(recipient);
+      if (!walletInfo) return;
+      processSwapEvent(eventLog, { hash: eventLog.transactionHash, from: recipient }, walletInfo)
+        .catch(e => log(`⚠️  processSwapEvent: ${e.message}`));
+    });
+    log(`📡 Subscribed to Swap events for ${trackedWallets.size} wallets`);
+  }
+
+  // four.meme TokenPurchase subscription
+  wsProvider.on(
+    { address: FOUR_MEME_CONTRACT, topics: [FOUR_MEME_PURCHASE_TOPIC] },
+    (eventLog) => processFourMemeEvent(eventLog).catch(e => log(`⚠️  processFourMemeEvent: ${e.message}`))
+  );
+  log('⚡ Subscribed to four.meme TokenPurchase events');
+}
+
 async function connectWebSocket() {
   if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
 
@@ -412,22 +460,19 @@ async function connectWebSocket() {
     log(`⚡ WebSocket connected | Block: ${wsLastBlock}`);
     sendTelegram(`⚡ CopyPulse WebSocket connected — monitoring ${trackedWallets.size} wallets`).catch(() => {});
 
-    wsProvider.on('block', (blockNumber) => {
-      wsLastBlock = blockNumber;
-      wsLastBlockTime = Date.now();
-      processBlock(blockNumber).catch(e => log(`⚠️  processBlock ${blockNumber}: ${e.message}`));
-    });
-
-    // four.meme TokenPurchase log subscription
-    wsProvider.on(
-      { address: FOUR_MEME_CONTRACT, topics: [FOUR_MEME_PURCHASE_TOPIC] },
-      (eventLog) => processFourMemeEvent(eventLog).catch(e => log(`⚠️  processFourMemeEvent: ${e.message}`))
-    );
-    log('⚡ Subscribed to four.meme TokenPurchase events');
+    resubscribeSwaps();
 
   } catch (e) {
     wsConnected = false;
     log(`❌ WebSocket failed: ${e.message}`);
+    // Destroy the failed provider immediately — leaving it alive causes its
+    // internal _start() doDetect loop to spam "failed to detect network" every 1s
+    // until the next reconnect attempt cleans it up.
+    if (wsProvider) {
+      wsProvider.removeAllListeners();
+      try { wsProvider.destroy(); } catch (_) {}
+      wsProvider = null;
+    }
     scheduleWsReconnect();
   }
 }
@@ -464,34 +509,6 @@ function startWsWatchdog() {
   }, 60000);
 }
 
-async function processBlock(blockNumber) {
-  try {
-    const block = await provider.getBlock(blockNumber, true);
-    if (!block?.transactions?.length) return;
-
-    const trackedAddrs = new Set(trackedWallets.keys());
-    const routerLower  = PANCAKE_ROUTER.toLowerCase();
-
-    for (const tx of block.transactions) {
-      if (!tx?.from || !tx?.to) continue;
-      const from = tx.from.toLowerCase();
-      if (!trackedAddrs.has(from)) continue;
-      if (tx.to.toLowerCase() !== routerLower) continue;
-
-      // Get receipt and find the Swap event
-      const receipt = await provider.getTransactionReceipt(tx.hash).catch(() => null);
-      if (!receipt?.logs) continue;
-
-      const swapLog = receipt.logs.find(l => l.topics[0] === SWAP_TOPIC);
-      if (!swapLog) continue;
-
-      const walletInfo = trackedWallets.get(from);
-      await processSwapEvent(swapLog, tx, walletInfo);
-    }
-  } catch (e) {
-    log(`⚠️  processBlock ${blockNumber}: ${e.message}`);
-  }
-}
 
 async function processSwapEvent(swapLog, tx, walletInfo) {
   try {
