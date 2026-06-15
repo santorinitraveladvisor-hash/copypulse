@@ -88,6 +88,7 @@ const PANCAKE_ROUTER_ABI = [
 
 const ERC20_ABI = [
   'function balanceOf(address owner) view returns (uint256)',
+  'function allowance(address owner, address spender) view returns (uint256)',
   'function approve(address spender, uint256 amount) returns (bool)',
   'function decimals() view returns (uint8)',
   'function symbol() view returns (string)',
@@ -124,6 +125,9 @@ let dailyPnLBNB  = 0;
 let lastDailyReset = new Date().toDateString();
 const pairTokenCache    = new Map(); // pairAddr -> tokenAddr
 const fourMemeConsensus = new Map(); // tokenAddr -> { buyers: Set<address>, firstSeen: ms }
+const closingPositions  = new Set(); // tokenAddresses currently being sold — double-fire guard
+const positionPairAddrs = new Map(); // tokenAddr -> pairAddr, for event-driven SL subscriptions
+const sellFailCounts    = new Map(); // tokenAddr -> consecutive sell failure count
 
 // WebSocket state
 let wsProvider        = null;
@@ -431,6 +435,31 @@ function resubscribeSwaps() {
     (eventLog) => processFourMemeEvent(eventLog).catch(e => log(`⚠️  processFourMemeEvent: ${e.message}`))
   );
   log('⚡ Subscribed to four.meme TokenPurchase events');
+
+  // Mirror-sell: ERC-20 Transfer events where topics[1] (indexed `from`) matches a tracked wallet.
+  // Fires whenever a tracked wallet sends any token out. handleMirrorSell checks whether the
+  // transferred token matches an open position that wallet originally triggered.
+  const trackedAddrs = [...trackedWallets.keys()];
+  if (trackedAddrs.length > 0) {
+    const paddedTracked = trackedAddrs.map(a => '0x' + a.replace('0x', '').padStart(64, '0'));
+    wsProvider.on(
+      { topics: [TRANSFER_TOPIC, paddedTracked] },
+      (eventLog) => {
+        const from  = ('0x' + eventLog.topics[1].slice(26)).toLowerCase();
+        const token = eventLog.address.toLowerCase();
+        handleMirrorSell(from, token).catch(e => log(`⚠️  handleMirrorSell: ${e.message}`));
+      }
+    );
+    log(`🔁 Mirror-sell subscribed for ${trackedAddrs.length} tracked wallets`);
+  }
+
+  // Re-register per-position event-SL pair subscriptions (cleared by removeAllListeners above)
+  for (const [tok, pair] of positionPairAddrs.entries()) {
+    subscribePriceSL(tok, pair);
+  }
+  if (positionPairAddrs.size > 0) {
+    log(`📡 [EVENT-SL] Re-subscribed ${positionPairAddrs.size} position pair(s)`);
+  }
 }
 
 async function connectWebSocket() {
@@ -561,7 +590,7 @@ async function processSwapEvent(swapLog, tx, walletInfo) {
     });
 
     await auditLog('SIGNAL_DETECTED', { walletAddress: tx.from, tokenAddress, txHash: tx.hash });
-    await executeBuy(tokenAddress, signal.id, walletInfo.traderId, walletInfo.name);
+    await executeBuy(tokenAddress, signal.id, walletInfo.traderId, walletInfo.name, tx.from);
   } catch (e) {
     log(`⚠️  processSwapEvent error: ${e.message}`);
   }
@@ -663,7 +692,7 @@ async function handleFourMemeKolSignal(tokenAddress, buyerAddr, walletInfo, bnbS
     }
   });
   await auditLog('SIGNAL_DETECTED', { source: '4.meme', walletAddress: buyerAddr, tokenAddress });
-  await executeBuy(tokenAddress, signal.id, walletInfo.traderId, walletInfo.name);
+  await executeBuy(tokenAddress, signal.id, walletInfo.traderId, walletInfo.name, buyerAddr);
 }
 
 async function handleFourMemeConsensusSignal(tokenAddress, buyerCount) {
@@ -697,7 +726,58 @@ async function handleFourMemeConsensusSignal(tokenAddress, buyerCount) {
     }
   });
   await auditLog('SIGNAL_DETECTED', { source: '4.meme-consensus', tokenAddress, buyerCount });
-  await executeBuy(tokenAddress, signal.id, traderId, `4.meme-${buyerCount}x`);
+  // consensus positions have no single triggering wallet — mirror-sell doesn't apply
+  await executeBuy(tokenAddress, signal.id, traderId, `4.meme-${buyerCount}x`, null);
+}
+
+// ─────────────────────────────────────────────
+// MIRROR-SELL
+// ─────────────────────────────────────────────
+
+// Called on every ERC-20 Transfer where `from` is a tracked wallet.
+// Checks whether the token matches an open position that wallet originally triggered,
+// and if so calls a full exit. Consensus positions (triggeredByWallet = null) are
+// excluded — they have no single wallet to follow on the way out.
+async function handleMirrorSell(fromAddr, tokenAddr) {
+  const from  = fromAddr.toLowerCase();
+  const token = tokenAddr.toLowerCase();
+  const pos   = openPositions.get(token);
+  if (!pos) return;                           // we don't hold it
+  if (pos.stuck) return;                      // flagged unsellable — manual exit required
+  if (pos.triggeredByWallet !== from) return; // not the wallet that got us in
+  if (closingPositions.has(token)) return;    // already closing — guard
+  const name = trackedWallets.get(from)?.name || from.slice(0, 10) + '...';
+  log(`🔁 Mirror-sell: ${name} exited ${pos.symbol} — closing our position`);
+  sendTelegram(`🔁 Mirror-sell — ${pos.symbol}\n${name} is exiting`).catch(() => {});
+  await executeSell(token, pos, 'MIRROR_SELL');
+}
+
+// ─────────────────────────────────────────────
+// EVENT-DRIVEN STOP-LOSS
+// ─────────────────────────────────────────────
+const MAX_SELL_FAILURES = 3;
+
+function subscribePriceSL(tokenAddr, pairAddr) {
+  if (!wsProvider || !wsConnected) return;
+  wsProvider.on(
+    { address: pairAddr, topics: [SWAP_TOPIC] },
+    () => {
+      const pos = openPositions.get(tokenAddr);
+      if (!pos || pos.stuck || closingPositions.has(tokenAddr)) return;
+      checkPriceSL(tokenAddr, pos, pairAddr).catch(() => {});
+    }
+  );
+}
+
+async function checkPriceSL(tokenAddr, position, pairAddr) {
+  const currentPrice = await getTokenPriceBNB(tokenAddr, position.tokenAmount);
+  if (!currentPrice) return;
+  const pnlPct = ((currentPrice - position.buyPrice) / position.buyPrice) * 100;
+  if (pnlPct <= -CONFIG.STOP_LOSS_PCT) {
+    log(`🛑 [EVENT-SL] Stop loss hit! ${position.symbol} ${pnlPct.toFixed(1)}%`);
+    sendTelegram(`🛑 Event-SL — ${position.symbol} ${pnlPct.toFixed(1)}%`).catch(() => {});
+    await executeSell(tokenAddr, position, 'STOP_LOSS');
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -727,7 +807,7 @@ async function getBnbAmountForUsd(usdAmount) {
   }
 }
 
-async function executeBuy(tokenAddress, signalId, traderId, traderName = 'Unknown') {
+async function executeBuy(tokenAddress, signalId, traderId, traderName = 'Unknown', triggeredByWallet = null) {
   if (!wallet || !CONFIG.SELF_TRADE) {
     const reason = !wallet ? 'No WALLET_PRIVATE_KEY set' : 'SELF_TRADE=false (monitor-only mode)';
     log(`📋 [MONITOR MODE] Signal: ${tokenAddress} — ${reason}`);
@@ -794,7 +874,21 @@ async function executeBuy(tokenAddress, signalId, traderId, traderName = 'Unknow
       signalId,
       traderId,
       decimals,
+      triggeredByWallet: triggeredByWallet ? triggeredByWallet.toLowerCase() : null,
     });
+
+    // Event-driven SL: resolve pair and subscribe to Swap events on it
+    {
+      const _factory = new ethers.Contract(PANCAKE_FACTORY, FACTORY_ABI, provider);
+      _factory.getPair(tokenAddress, WBNB).then(pairAddr => {
+        if (pairAddr && pairAddr !== ethers.ZeroAddress) {
+          const tok = tokenAddress.toLowerCase();
+          positionPairAddrs.set(tok, pairAddr.toLowerCase());
+          subscribePriceSL(tok, pairAddr.toLowerCase());
+          log(`📡 [EVENT-SL] Subscribed pair ${pairAddr.slice(0, 10)}... for ${symbol}`);
+        }
+      }).catch(e => log(`⚠️  [EVENT-SL] Pair lookup failed: ${e.message}`));
+    }
 
     // Save to DB
     const account = await prisma.exchangeAccount.findFirst({ where: { isActive: true } });
@@ -828,6 +922,10 @@ async function executeBuy(tokenAddress, signalId, traderId, traderName = 'Unknow
 
 async function executeSell(tokenAddress, position, reason) {
   if (!wallet) return;
+  // Double-fire guard: mirror-sell, event-SL, and poll-SL can all race.
+  // Only the first caller proceeds; the rest are silently dropped.
+  if (closingPositions.has(tokenAddress)) return;
+  closingPositions.add(tokenAddress);
 
   try {
     const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, wallet);
@@ -836,11 +934,20 @@ async function executeSell(tokenAddress, position, reason) {
 
     if (tokenBalance === 0n) {
       openPositions.delete(tokenAddress);
+      closingPositions.delete(tokenAddress);
+      positionPairAddrs.delete(tokenAddress.toLowerCase());
+      sellFailCounts.delete(tokenAddress.toLowerCase());
       return;
     }
 
-    // Approve router
-    await tokenContract.approve(PANCAKE_ROUTER, tokenBalance);
+    // Approve router — max-approve if current allowance is insufficient, then wait for mine
+    const allowance = await tokenContract.allowance(wallet.address, PANCAKE_ROUTER);
+    if (allowance < tokenBalance) {
+      log(`🔑 Approving router for ${position.symbol}...`);
+      const approveTx = await tokenContract.approve(PANCAKE_ROUTER, ethers.MaxUint256);
+      await approveTx.wait();
+      log(`✅ Approval confirmed — proceeding to swap`);
+    }
 
     const path = [tokenAddress, WBNB];
     const deadline = Math.floor(Date.now() / 1000) + 60 * 5;
@@ -890,6 +997,9 @@ async function executeSell(tokenAddress, position, reason) {
     }).catch(e => log(`⚠️  TradeResult save failed: ${e.message}`));
 
     openPositions.delete(tokenAddress);
+    closingPositions.delete(tokenAddress);
+    positionPairAddrs.delete(tokenAddress.toLowerCase());
+    sellFailCounts.delete(tokenAddress.toLowerCase());
 
     const account = await prisma.exchangeAccount.findFirst({ where: { isActive: true } });
     await prisma.copiedOrder.create({
@@ -911,6 +1021,17 @@ async function executeSell(tokenAddress, position, reason) {
     await auditLog('SELL_EXECUTED', { tokenAddress, symbol: position.symbol, pnlBNB, pnlPct, reason });
 
   } catch (e) {
+    closingPositions.delete(tokenAddress); // allow retry — sell failed before completing
+    const tok = tokenAddress.toLowerCase();
+    const failures = (sellFailCounts.get(tok) || 0) + 1;
+    sellFailCounts.set(tok, failures);
+    if (failures >= MAX_SELL_FAILURES) {
+      position.stuck = true;
+      positionPairAddrs.delete(tok); // stop the event-SL loop
+      sellFailCounts.delete(tok);
+      log(`🚨 [STUCK] ${position?.symbol || tok} failed ${failures} consecutive sells — likely honeypot, unsubscribed event-SL`);
+      sendTelegram(`🚨 STUCK position — ${position?.symbol || tok}\nSell reverted ${failures}x — likely honeypot\nManual exit required`).catch(() => {});
+    }
     log(`❌ Sell failed for ${tokenAddress}: ${e.message}`);
     await auditLog('SELL_FAILED', { tokenAddress, error: e.message }, 'ERROR');
   }
@@ -924,6 +1045,8 @@ async function monitorPositions() {
 
   for (const [tokenAddress, position] of openPositions.entries()) {
     try {
+      if (position.stuck) continue; // flagged unsellable — manual exit required
+
       const currentPrice = await getTokenPriceBNB(tokenAddress, position.tokenAmount);
       if (!currentPrice) continue;
 
