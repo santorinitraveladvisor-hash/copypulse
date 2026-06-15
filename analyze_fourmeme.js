@@ -1,7 +1,17 @@
 #!/usr/bin/env node
 'use strict';
 
+// Load local .env only as a fallback — Railway/Neon vars take precedence
 require('dotenv').config();
+
+// Detect dead local Railway Postgres and refuse to use it
+const dbUrl = process.env.DATABASE_URL || '';
+if (dbUrl.includes('rlwy.net') || dbUrl.includes('railway.internal')) {
+  console.error('ERROR: DATABASE_URL points to local Railway Postgres (dead DB). Set it to the Neon URL before running.');
+  console.error('  export DATABASE_URL="$(railway variables --json | python3 -c \\"import sys,json; d=json.load(sys.stdin); print(d[\'DATABASE_URL_UNPOOLED\'])\\"")"');
+  process.exit(1);
+}
+
 const { ethers } = require('ethers');
 const { PrismaClient } = require('@prisma/client');
 
