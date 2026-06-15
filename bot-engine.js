@@ -710,6 +710,7 @@ async function handleFourMemeConsensusSignal(tokenAddress, buyerCount, entryPric
       await prisma.fourMemeSignal.create({
         data: { tokenAddress, walletCount: buyerCount, entryPriceBnb },
       });
+      log(`📝 [4.meme] Logged signal for ${tokenAddress.slice(0, 10)}... (${buyerCount} wallets)`);
     }
   } catch (e) {
     log(`⚠️  [4.meme log] ${e.message}`);
