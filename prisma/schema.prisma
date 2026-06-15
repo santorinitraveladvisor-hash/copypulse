@@ -137,3 +137,17 @@ model TradeResult {
   pnlPct       Float
   createdAt    DateTime @default(now())
 }
+
+model FourMemeSignal {
+  id              String    @id @default(cuid())
+  tokenAddress    String
+  signalTime      DateTime  @default(now())
+  walletCount     Int
+  entryPriceBnb   Float?
+  graduated       Boolean   @default(false)
+  checkedAt       DateTime?
+  currentPriceBnb Float?
+  status          String?   // 'graduated', 'no_pair_yet', 'likely_rug'
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+}

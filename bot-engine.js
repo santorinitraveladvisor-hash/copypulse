@@ -646,16 +646,20 @@ async function processFourMemeEvent(eventLog) {
     const now = Date.now();
     let entry = fourMemeConsensus.get(tokenAddress);
     if (!entry || now - entry.firstSeen > 2 * 60 * 1000) {
-      entry = { buyers: new Set(), firstSeen: now };
+      entry = { buyers: new Set(), firstSeen: now, lastPrice: null };
       fourMemeConsensus.set(tokenAddress, entry);
     }
     entry.buyers.add(buyer);
+    // Track effective price from this buyer's trade (BNB per token, 18-dec assumed for four.meme)
+    const tokenAmtF = parseFloat(ethers.formatEther(decoded[3]));
+    if (tokenAmtF > 0) entry.lastPrice = bnbSpent / tokenAmtF;
 
     if (entry.buyers.size >= 3) {
       const buyerCount = entry.buyers.size;
+      const entryPriceBnb = entry.lastPrice;
       fourMemeConsensus.delete(tokenAddress); // prevent re-triggering on the same wave
       log(`🔥 [4.meme Consensus] ${buyerCount} wallets bought ${tokenAddress.slice(0, 10)}... in 2min`);
-      await handleFourMemeConsensusSignal(tokenAddress, buyerCount);
+      await handleFourMemeConsensusSignal(tokenAddress, buyerCount, entryPriceBnb);
     }
   } catch (e) {
     log(`⚠️  processFourMemeEvent: ${e.message}`);
@@ -695,7 +699,22 @@ async function handleFourMemeKolSignal(tokenAddress, buyerAddr, walletInfo, bnbS
   await executeBuy(tokenAddress, signal.id, walletInfo.traderId, walletInfo.name, buyerAddr);
 }
 
-async function handleFourMemeConsensusSignal(tokenAddress, buyerCount) {
+async function handleFourMemeConsensusSignal(tokenAddress, buyerCount, entryPriceBnb = null) {
+  // Log every consensus signal for graduation analysis — dedupe within 6h per token
+  try {
+    const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
+    const existing = await prisma.fourMemeSignal.findFirst({
+      where: { tokenAddress, signalTime: { gte: sixHoursAgo } },
+    });
+    if (!existing) {
+      await prisma.fourMemeSignal.create({
+        data: { tokenAddress, walletCount: buyerCount, entryPriceBnb },
+      });
+    }
+  } catch (e) {
+    log(`⚠️  [4.meme log] ${e.message}`);
+  }
+
   if (openPositions.has(tokenAddress)) return;
   if (openPositions.size >= CONFIG.MAX_OPEN_POSITIONS) {
     log(`⚠️  Max positions reached, skipping [4.meme consensus]`);
