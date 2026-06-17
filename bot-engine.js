@@ -1189,9 +1189,9 @@ async function tokenSafetyCheck(tokenAddress) {
 
       // Liquidity
       const liquidityUsd = best.liquidity?.usd || 0;
-      if (liquidityUsd < 10_000) {
+      if (liquidityUsd < 7_500) {
         log(`🚫 [LIQUIDITY] ${tokenAddress} only $${liquidityUsd.toFixed(0)} liquidity`);
-        return { ok: false, reason: `Insufficient liquidity: $${liquidityUsd.toFixed(0)} (min $10,000)` };
+        return { ok: false, reason: `Insufficient liquidity: $${liquidityUsd.toFixed(0)} (min $7,500)` };
       }
       log(`✅ [LIQUIDITY] $${liquidityUsd.toFixed(0)}`);
     } else {
