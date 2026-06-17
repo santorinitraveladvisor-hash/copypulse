@@ -603,6 +603,8 @@ async function getTokenFromPair(pairAddr) {
     const PAIR_ABI_TOKENS = ['function token0() view returns (address)', 'function token1() view returns (address)'];
     const pair = new ethers.Contract(key, PAIR_ABI_TOKENS, provider);
     const [t0, t1] = await Promise.all([pair.token0(), pair.token1()]);
+    // Assumes Pancake WBNB pair (most memecoin signals). For non-WBNB pairs this will pick one side;
+    // bnbIn calc in caller will only be valid for WBNB pairs. Non-WBNB/curve tokens use four.meme direct paths.
     const token = t0.toLowerCase() === WBNB.toLowerCase() ? t1.toLowerCase() : t0.toLowerCase();
     pairTokenCache.set(key, token);
     return token;
@@ -1119,6 +1121,12 @@ async function estimateBNBReceived(tokenAddress, tokenAmount) {
     const amounts = await router.getAmountsOut(tokenAmount, path);
     return parseFloat(ethers.formatEther(amounts[1]));
   } catch (e) {
+    // Non-WBNB / curve fallback (see getPositionExitValueBNB)
+    try {
+      const ds = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`, { timeout: 2000 }).catch(() => null);
+      const p = ds?.data?.pairs?.find(pp => pp.chainId === 'bsc' && pp.priceNative);
+      if (p && p.priceNative && human > 0) return human * parseFloat(p.priceNative);
+    } catch (_) {}
     return 0;
   }
 }
@@ -1193,7 +1201,7 @@ async function tokenSafetyCheck(tokenAddress) {
         const pairAddr = await factory.getPair(tokenAddress, WBNB);
         if (pairAddr === ethers.ZeroAddress) {
           log(`🚫 [LIQUIDITY] No PancakeSwap pair found for ${tokenAddress}`);
-          return { ok: false, reason: 'No PancakeSwap WBNB pair found' };
+          return { ok: false, reason: 'No PancakeSwap WBNB pair found (token may still be on four.meme curve — non-WBNB support active for direct paths)' };
         }
         const pair = new ethers.Contract(pairAddr, PAIR_ABI, provider);
         const [r0, r1] = await pair.getReserves();
