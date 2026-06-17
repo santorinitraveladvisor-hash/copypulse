@@ -1180,7 +1180,7 @@ async function tokenSafetyCheck(tokenAddress) {
       // Contract age
       if (best.pairCreatedAt) {
         const ageHours = (Date.now() - best.pairCreatedAt) / 3_600_000;
-        if (ageHours < 6) {
+        if (ageHours < 1) {
           log(`🚫 [AGE] ${tokenAddress} pair created ${ageHours.toFixed(1)}h ago — too new`);
           return { ok: false, reason: `Token too new: pair created ${ageHours.toFixed(1)}h ago` };
         }
