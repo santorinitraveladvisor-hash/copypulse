@@ -26,8 +26,15 @@ export async function addTrader(formData: FormData) {
 }
 
 export async function deleteTrader(id: string) {
-  await prisma.trader.delete({
-    where: { id }
-  });
-  revalidatePath('/traders');
+  try {
+    await prisma.trader.update({
+      where: { id },
+      data: { isActive: false },
+    });
+    revalidatePath('/traders');
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error('[deleteTrader] failed:', msg);
+    throw new Error(`Failed to remove trader: ${msg}`);
+  }
 }

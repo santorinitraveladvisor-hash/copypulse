@@ -5,7 +5,7 @@ import { addTrader, deleteTrader } from './actions';
 export const dynamic = 'force-dynamic';
 
 export default async function Traders() {
-  const traders = await prisma.trader.findMany();
+  const traders = await prisma.trader.findMany({ where: { isActive: true } });
 
   return (
     <div className="max-w-6xl mx-auto space-y-8 animate-in fade-in duration-500">
