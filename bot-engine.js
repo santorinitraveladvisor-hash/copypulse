@@ -20,11 +20,11 @@ const prisma = new PrismaClient();
 // ─────────────────────────────────────────────
 const CONFIG = {
   BSC_RPC: process.env.BSC_RPC || 'https://bsc-rpc.publicnode.com',
-  BSC_WSS: process.env.QUICKNODE_WSS || 'wss://fluent-quaint-night.bsc.quiknode.pro/d99bf44ca3a1432d3b3a975cdb6b3d4b3ca013ad/',
+  BSC_WSS: 'wss://bsc.publicnode.com', // primary — reliable free endpoint
   BSC_WSS_FALLBACKS: [
-    'wss://bsc-ws-node.nariox.org:443',
-    'wss://bsc.publicnode.com',
     'wss://bsc-rpc.publicnode.com',
+    'wss://bsc-ws-node.nariox.org:443',
+    process.env.QUICKNODE_WSS || 'wss://fluent-quaint-night.bsc.quiknode.pro/d99bf44ca3a1432d3b3a975cdb6b3d4b3ca013ad/', // rate-limited — last resort
   ],
   WALLET_PRIVATE_KEY: process.env.WALLET_PRIVATE_KEY || '',
 
