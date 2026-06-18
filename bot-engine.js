@@ -484,6 +484,19 @@ async function connectWebSocket() {
 
     wsProvider = new ethers.WebSocketProvider(wsUrl);
 
+    // Attach a raw 'error' handler on the underlying ws.WebSocket immediately.
+    // Without this, any error emitted before ethers registers its own listener
+    // becomes an unhandled event and crashes Node. The handler just absorbs it —
+    // the try/catch below and scheduleWsReconnect() handle the actual recovery.
+    try {
+      const rawWs = wsProvider.websocket;
+      if (rawWs && typeof rawWs.on === 'function') {
+        rawWs.on('error', (err) => {
+          log(`⚠️  [WS raw error] ${err.message}`);
+        });
+      }
+    } catch (_) {}
+
     // Verify the connection responds before marking it live
     const connectTimeout = new Promise((_, rej) => setTimeout(() => rej(new Error('connect timeout')), 10000));
     wsLastBlock = await Promise.race([wsProvider.getBlockNumber(), connectTimeout]);
@@ -1389,6 +1402,18 @@ function startStatusServer() {
   });
   server.listen(3001, () => log('📡 Status server on http://localhost:3001/engine-status'));
 }
+
+// ─────────────────────────────────────────────
+// PROCESS-LEVEL SAFETY NETS
+// Last-resort catches — log and survive, never crash the bot.
+// ─────────────────────────────────────────────
+process.on('uncaughtException', (err) => {
+  log(`🚨 [uncaughtException] ${err.message} — continuing`);
+});
+
+process.on('unhandledRejection', (reason) => {
+  log(`🚨 [unhandledRejection] ${reason?.message ?? String(reason)} — continuing`);
+});
 
 // ─────────────────────────────────────────────
 // START
