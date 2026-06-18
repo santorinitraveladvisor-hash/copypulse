@@ -849,7 +849,7 @@ async function executeBuy(tokenAddress, signalId, traderId, traderName = 'Unknow
       return;
     }
 
-    const tradeBnb = await getBnbAmountForUsd(10); // $10 USD worth of BNB
+    const tradeBnb = await getBnbAmountForUsd(20); // $20 USD worth of BNB
     const bnbAmount = ethers.parseEther(tradeBnb.toFixed(8));
     const path = [WBNB, tokenAddress];
     const deadline = Math.floor(Date.now() / 1000) + 60 * 5; // 5 min
