@@ -1177,16 +1177,6 @@ async function tokenSafetyCheck(tokenAddress) {
     if (pairs.length > 0) {
       const best = pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
 
-      // Contract age
-      if (best.pairCreatedAt) {
-        const ageHours = (Date.now() - best.pairCreatedAt) / 3_600_000;
-        if (ageHours < 1) {
-          log(`🚫 [AGE] ${tokenAddress} pair created ${ageHours.toFixed(1)}h ago — too new`);
-          return { ok: false, reason: `Token too new: pair created ${ageHours.toFixed(1)}h ago` };
-        }
-        log(`✅ [AGE] pair age: ${ageHours.toFixed(1)}h`);
-      }
-
       // Liquidity
       const liquidityUsd = best.liquidity?.usd || 0;
       if (liquidityUsd < 7_500) {
