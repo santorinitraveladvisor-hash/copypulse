@@ -21,7 +21,11 @@ const prisma = new PrismaClient();
 const CONFIG = {
   BSC_RPC: process.env.BSC_RPC || 'https://bsc-rpc.publicnode.com',
   BSC_WSS: process.env.QUICKNODE_WSS || 'wss://fluent-quaint-night.bsc.quiknode.pro/d99bf44ca3a1432d3b3a975cdb6b3d4b3ca013ad/',
-  BSC_WSS_FALLBACK: 'wss://bsc-rpc.publicnode.com',
+  BSC_WSS_FALLBACKS: [
+    'wss://bsc-ws-node.nariox.org:443',
+    'wss://bsc.publicnode.com',
+    'wss://bsc-rpc.publicnode.com',
+  ],
   WALLET_PRIVATE_KEY: process.env.WALLET_PRIVATE_KEY || '',
 
   // Binance API — used for momentum cross-check before executing buys
@@ -137,6 +141,7 @@ let wsLastBlockTime   = 0;
 let wsReconnectDelay  = 2000;
 let wsReconnectTimer  = null;
 let wsDisconnectTime  = 0;
+let wsEndpointIdx     = 0;   // rotates through BSC_WSS + BSC_WSS_FALLBACKS on each failure
 
 // ─────────────────────────────────────────────
 // INIT
@@ -465,9 +470,10 @@ function resubscribeSwaps() {
 async function connectWebSocket() {
   if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
 
-  // Use fallback after repeated failures (backoff > 32s means ≥4 failed attempts)
-  const wsUrl = wsReconnectDelay > 32000 ? CONFIG.BSC_WSS_FALLBACK : CONFIG.BSC_WSS;
-  log(`⚡ WebSocket connecting: ${wsUrl}`);
+  // Rotate through primary + fallbacks on each failure: QuickNode → nariox → publicnode → bsc-rpc
+  const allEndpoints = [CONFIG.BSC_WSS, ...CONFIG.BSC_WSS_FALLBACKS];
+  const wsUrl = allEndpoints[wsEndpointIdx % allEndpoints.length];
+  log(`⚡ WebSocket connecting [${wsEndpointIdx % allEndpoints.length + 1}/${allEndpoints.length}]: ${wsUrl}`);
 
   try {
     if (wsProvider) {
@@ -484,6 +490,7 @@ async function connectWebSocket() {
     wsLastBlockTime = Date.now();
     wsConnected = true;
     wsReconnectDelay = 2000; // reset backoff on success
+    wsEndpointIdx = 0;       // reset rotation — primary gets first shot after recovery
     wsDisconnectTime = 0;
 
     log(`⚡ WebSocket connected | Block: ${wsLastBlock}`);
@@ -493,6 +500,7 @@ async function connectWebSocket() {
 
   } catch (e) {
     wsConnected = false;
+    wsEndpointIdx++; // advance to next endpoint on next attempt
     log(`❌ WebSocket failed: ${e.message}`);
     // Destroy the failed provider immediately — leaving it alive causes its
     // internal _start() doDetect loop to spam "failed to detect network" every 1s
